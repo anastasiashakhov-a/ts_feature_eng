@@ -179,6 +179,28 @@ class MetaFeatureExtractor(TimeSeriesTransformer):
                 UserWarning
             )
         
+        # === ЗАМЕНА NaN НА ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ===
+        for key, value in self.meta_features_.items():
+            if np.isnan(value):
+                # Дефолты для информационно-теоретических и сложностных признаков
+                if any(kw in key for kw in ["entropy", "permutation", "hurst", "nonlinearity"]):
+                    self.meta_features_[key] = 1.0  # максимальная сложность/хаотичность
+                # Дефолты для стационарности
+                elif "stationarity" in key:
+                    self.meta_features_[key] = 1.0  # нестационарность по умолчанию
+                # Дефолты для спектральных признаков
+                elif "spectral_entropy" in key or "dominant_freq" in key or "peak_frequency_ratio" in key:
+                    self.meta_features_[key] = 0.0
+                # Дефолты для автокорреляции
+                elif "acf" in key or "pacf" in key:
+                    self.meta_features_[key] = 0.0
+                # Дефолты для ландмарковых ошибок
+                elif "error" in key or "ratio" in key:
+                    self.meta_features_[key] = 1.0  # умеренная ошибка
+                # Дефолты для простых и статистических признаков
+                else:
+                    self.meta_features_[key] = 0.0
+
         # Сохранение имен признаков
         self.feature_names_ = sorted(self.meta_features_.keys())
         self.is_fitted_ = True
