@@ -1,0 +1,66 @@
+# .pre-commit-config.yaml
+# Автоматические проверки кода перед коммитом
+# Установка: pdm run pre-commit install
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.1  # Последняя стабильная версия на 2026-02-06
+    hooks:
+      # Линтер: проверка и исправление ошибок стиля
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        types: [python]
+        exclude: |
+          (?x)^(
+            tests/.*|
+            examples/.*
+          )$
+      
+      # Форматтер: автоматическое форматирование кода
+      - id: ruff-format
+        types: [python]
+        exclude: |
+          (?x)^(
+            tests/.*|
+            examples/.*
+          )$
+  
+  # Базовые проверки для чистоты кода
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace  # Удаление пробелов в конце строк
+        types: [python, yaml, markdown]
+      
+      - id: end-of-file-fixer     # Обеспечение перевода строки в конце файла
+        types: [python, yaml, markdown]
+      
+      - id: check-yaml            # Валидация YAML-файлов
+        files: \.(yaml|yml)$
+      
+      - id: check-toml            # Валидация TOML-файлов
+        files: \.toml$
+      
+      - id: debug-statements      # Обнаружение отладочных принтов/логов
+        types: [python]
+        exclude: ^tests/
+  
+  # Проверка лицензии в заголовках файлов (опционально)
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+      - id: insert-license
+        files: \.py$
+        args:
+          - --license-filepath
+          - LICENSE
+          - --comment-style
+          - "# "
+          - --use-current-year
+
+# Автоматический запуск хуков при установке
+default_install_hook_types: [pre-commit, pre-push]
+
+# Кэширование для ускорения работы
+default_language_version:
+  python: python3.12
