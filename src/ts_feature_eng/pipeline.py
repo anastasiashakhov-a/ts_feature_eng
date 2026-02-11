@@ -662,3 +662,185 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         
         except Exception as e:
             raise TimeSeriesError(f"Ошибка при загрузке состояния: {e}")
+
+
+    def analyze_feature_selection(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Optional[Union[pd.Series, np.ndarray]] = None,
+        comparison_methods: List[str] = ["shap", "pearson", "f_regression", "mutual_info"],
+        top_k: int = 20,
+        plot_correlation_matrix: bool = True,
+        save_plots: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Анализ эффективности различных стратегий отбора признаков.
+        
+        Параметры
+        ----------
+        X : pd.DataFrame или np.ndarray
+            Входные данные временного ряда.
+        y : pd.Series или np.ndarray, опционально
+            Целевая переменная (требуется для корреляции/модельных методов).
+        comparison_methods : List[str], по умолчанию ["shap", "pearson", ...]
+            Список методов для сравнения:
+            - "shap": SHAP важность (требует обученной модели)
+            - "pearson": Корреляция Пирсона с целевой переменной
+            - "f_regression": F-статистика ANOVA
+            - "mutual_info": Взаимная информация
+        top_k : int, по умолчанию 20
+            Количество признаков для отбора по каждой стратегии.
+        plot_correlation_matrix : bool, по умолчанию True
+            Строить ли матрицу корреляций между отобранными признаками.
+        save_plots : bool, по умолчанию True
+            Сохранять ли графики на диск.
+        
+        Возвращает
+        ----------
+        analysis_results : Dict[str, Any]
+            Словарь с результатами анализа:
+            - 'selected_features_by_method': Dict[str, List[str]]
+            - 'correlation_matrices': Dict[str, pd.DataFrame]
+            - 'intersection_analysis': pd.DataFrame
+            - 'performance_comparison': pd.DataFrame (если y предоставлена)
+        """
+        from sklearn.feature_selection import f_regression, mutual_info_regression, SelectKBest
+        from sklearn.linear_model import Ridge
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
+        if not self.is_fitted_:
+            raise TimeSeriesError("AutoFeatureEngineer must be fitted before calling analyze_feature_selection.")
+        
+        if y is None and any(m in comparison_methods for m in ["pearson", "f_regression", "mutual_info"]):
+            raise ValueError("Target variable 'y' is required for correlation/model-based selection methods.")
+        
+        # Шаг 1: Генерация признаков через обученный пайплайн
+        X_transformed = self.best_pipeline_.transform(X)
+        
+        if self.apply_selection and self.selector_ is not None:
+            # Если пост-селектор уже обучен, применяем его для согласованности
+            X_transformed = self.selector_.transform(X_transformed)
+        
+        print(f"Анализ отбора признаков на {X_transformed.shape[1]} сгенерированных признаках...")
+        
+        results = {}
+        
+        # Метод 1: SHAP (если модель обучена)
+        if "shap" in comparison_methods and self.model_ is not None:
+            try:
+                import shap
+                explainer = shap.LinearExplainer(self.model_, X_transformed.fillna(0).iloc[:100])
+                shap_values = explainer.shap_values(X_transformed.fillna(0).iloc[:100])
+                shap_importance = np.abs(shap_values).mean(0)
+                shap_feature_names = X_transformed.columns
+                top_shap_idx = np.argsort(shap_importance)[-top_k:][::-1]
+                results["shap"] = [shap_feature_names[i] for i in top_shap_idx]
+            except ImportError:
+                print("SHAP не установлен. Пропускаем SHAP-анализ.")
+            except Exception as e:
+                print(f"Ошибка при SHAP-анализе: {e}")
+        
+        # Метод 2: Корреляция Пирсона
+        if "pearson" in comparison_methods and y is not None:
+            correlations = X_transformed.corrwith(y).abs().sort_values(ascending=False)
+            results["pearson"] = correlations.head(top_k).index.tolist()
+        
+        # Метод 3: F-регрессия
+        if "f_regression" in comparison_methods and y is not None:
+            selector_f = SelectKBest(score_func=f_regression, k=top_k)
+            X_f_selected = selector_f.fit_transform(X_transformed.fillna(0), y)
+            results["f_regression"] = X_transformed.columns[selector_f.get_support()].tolist()
+        
+        # Метод 4: Взаимная информация
+        if "mutual_info" in comparison_methods and y is not None:
+            mi_scores = mutual_info_regression(X_transformed.fillna(0), y, random_state=42)
+            mi_feature_scores = pd.Series(mi_scores, index=X_transformed.columns).sort_values(ascending=False)
+            results["mutual_info"] = mi_feature_scores.head(top_k).index.tolist()
+        
+        # Проверяем, что хотя бы один метод сработал
+        if not results:
+            raise ValueError("Ни один из запрошенных методов отбора не может быть применен.")
+        
+        print(f"Отбор выполнено по {len(results)} методам: {list(results.keys())}")
+        
+        # Шаг 2: Анализ пересечений
+        from itertools import combinations
+        intersection_analysis = []
+        for method1, method2 in combinations(results.keys(), 2):
+            set1 = set(results[method1])
+            set2 = set(results[method2])
+            intersection = len(set1 & set2)
+            union = len(set1 | set2)
+            jaccard = intersection / union if union > 0 else 0
+            intersection_analysis.append({
+                "Method_1": method1,
+                "Method_2": method2,
+                "Intersection_Count": intersection,
+                "Jaccard_Similarity": jaccard
+            })
+        
+        intersection_df = pd.DataFrame(intersection_analysis)
+        
+        # Шаг 3: Матрицы корреляций
+        correlation_matrices = {}
+        if plot_correlation_matrix:
+            for method_name, selected_features in results.items():
+                if len(selected_features) == 0:
+                    continue
+                X_subset = X_transformed[selected_features].fillna(0)
+                corr_matrix = X_subset.corr()
+                correlation_matrices[method_name] = corr_matrix
+                
+                if save_plots:
+                    plt.figure(figsize=(10, 8))
+                    sns.heatmap(
+                        corr_matrix,
+                        annot=True,
+                        fmt=".2f",
+                        cmap="coolwarm",
+                        center=0,
+                        square=True,
+                        cbar_kws={"shrink": 0.8}
+                    )
+                    plt.title(f"Матрица корреляций: {method_name} (top-{top_k} features)")
+                    plt.tight_layout()
+                    plt.savefig(f"correlation_matrix_{method_name}.png", dpi=150, bbox_inches='tight')
+                    plt.close()
+                    print(f"  Матрица корреляций для {method_name} сохранена как 'correlation_matrix_{method_name}.png'")
+        
+        # Шаг 4: Сравнение производительности (если предоставлена целевая переменная)
+        performance_comparison = None
+        if y is not None:
+            model_for_comparison = Ridge(alpha=1.0, random_state=42)
+            perf_data = []
+            
+            for method_name, selected_features in results.items():
+                if len(selected_features) == 0:
+                    continue
+                X_subset = X_transformed[selected_features].fillna(0)
+                
+                # Кросс-валидация
+                from sklearn.model_selection import cross_val_score
+                scores = cross_val_score(model_for_comparison, X_subset, y, cv=3, scoring='neg_mean_absolute_error')
+                mean_mae = -scores.mean()
+                std_mae = scores.std()
+                
+                perf_data.append({
+                    "Method": method_name,
+                    "Mean_MAE": mean_mae,
+                    "Std_MAE": std_mae,
+                    "Num_Features_Selected": len(selected_features)
+                })
+            
+            performance_comparison = pd.DataFrame(perf_data)
+            performance_comparison = performance_comparison.sort_values("Mean_MAE")
+        
+        analysis_results = {
+            "selected_features_by_method": results,
+            "intersection_analysis": intersection_df,
+            "correlation_matrices": correlation_matrices,
+            "performance_comparison": performance_comparison
+        }
+        
+        return analysis_results
