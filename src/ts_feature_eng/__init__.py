@@ -80,4 +80,10 @@ __all__ = [
     "smape",
     "mase",
     "r2",
+
+    "analyze_feature_selection",
+    "compare_feature_selection_methods",
+    "analyze_feature_intersection", 
+    "plot_correlation_matrix",
+    "evaluate_selection_impact",
 ]
