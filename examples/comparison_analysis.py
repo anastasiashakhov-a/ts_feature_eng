@@ -3,10 +3,12 @@
 Сравнение стратегий отбора признаков на реальных данных из Марокко.
 
 Анализирует:
-- Структуру временного ряда через мета-признаки
+- Структуру временного ряда через мета-признаки (включая статистические тесты)
 - Выбор оптимальных методов инженерии признаков
 - Влияние отбора на качество прогноза
 - Интерпретацию важности признаков через SHAP
+- Сравнение линейных и нелинейных методов отбора (Pearson vs Distance Correlation)
+- Блоковую оценку эффективности групп признаков
 """
 
 import os
@@ -19,11 +21,18 @@ import warnings
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 
 from ts_feature_eng import AutoFeatureEngineer
 from ts_feature_eng.meta_features import MetaFeatureExtractor
 from ts_feature_eng.selection import CombinedFeatureSelector
+from ts_feature_eng.analysis import (
+    compare_feature_selection_methods,
+    analyze_feature_intersection,
+    plot_correlation_matrix,
+    evaluate_block_performance,
+    create_feature_blocks
+)
 
 
 def load_morocco_data(data_path=None):
@@ -113,6 +122,13 @@ def analyze_meta_features_structure(df):
     print(f"  Недельная ACF: {meta_features.get('acf_168', 0):.3f}")
     print(f"  Доминирующая частота: {meta_features.get('dominant_freq', 0):.4f}")
     
+    # Статистические тесты
+    print(f"\nСтатистические тесты:")
+    print(f"  Нормальность (Shapiro-Wilk p-value): {meta_features.get('normality_shapiro', 'N/A')}")
+    print(f"  Нормальность (Jarque-Bera p-value): {meta_features.get('normality_jarque', 'N/A')}")
+    print(f"  Автокорреляция (Ljung-Box p-value): {meta_features.get('autocorrelation_ljungbox', 'N/A')}")
+    print(f"  Гомоскедастичность (Breusch-Pagan p-value): {meta_features.get('homoskedasticity_bp', 'N/A')}")
+    
     return meta_features
 
 
@@ -168,7 +184,7 @@ def visualize_consumption_patterns(df):
     plt.tight_layout()
     plt.savefig("morocco_energy_patterns.png", dpi=150, bbox_inches='tight')
     print("  График сохранен как 'morocco_energy_patterns.png'")
-    plt.show()
+    plt.close(fig)  # Закрываем график, чтобы избежать предупреждений
 
 
 def analyze_feature_selection_process(df, meta_features):
@@ -237,11 +253,38 @@ def analyze_feature_selection_process(df, meta_features):
         insights["complexity"] = "low"
         print("  → Низкая сложность: линейные методы, оконные статистики")
     
+    # Статистические тесты
+    shapiro_p = meta_features.get('normality_shapiro', 1.0)
+    ljung_p = meta_features.get('autocorrelation_ljungbox', 1.0)
+    bp_p = meta_features.get('homoskedasticity_bp', 1.0)
+    
+    print(f"\nСтатистические свойства:")
+    if shapiro_p < 0.05:
+        print(f"  Распределение не нормальное (Shapiro-Wilk p-value = {shapiro_p:.3f})")
+        insights["normality"] = "non_normal"
+    else:
+        print(f"  Распределение нормальное (Shapiro-Wilk p-value = {shapiro_p:.3f})")
+        insights["normality"] = "normal"
+    
+    if ljung_p < 0.05:
+        print(f"  Значимая автокорреляция (Ljung-Box p-value = {ljung_p:.3f})")
+        insights["autocorrelation"] = "significant"
+    else:
+        print(f"  Нет значимой автокорреляции (Ljung-Box p-value = {ljung_p:.3f})")
+        insights["autocorrelation"] = "none"
+    
+    if bp_p < 0.05:
+        print(f"  Гетероскедастичность (Breusch-Pagan p-value = {bp_p:.3f})")
+        insights["homoskedasticity"] = "heteroskedastic"
+    else:
+        print(f"  Гомоскедастичность (Breusch-Pagan p-value = {bp_p:.3f})")
+        insights["homoskedasticity"] = "homoskedastic"
+    
     return insights
 
 
-def compare_selection_strategies(df, insights):
-    """Сравнение стратегий отбора признаков."""
+def compare_selection_strategies_with_insights(df, insights):
+    """Сравнение стратегий отбора признаков с учетом инсайтов."""
     print("\nСравнение стратегий отбора признаков...")
     
     y = df["consumption"].shift(-1).dropna()
@@ -251,7 +294,7 @@ def compare_selection_strategies(df, insights):
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
     
-    # Автоматическая инженерия признаков
+    # 1. Автоматическая инженерия признаков
     print("  Автоматическая инженерия признаков...")
     engineer = AutoFeatureEngineer(
         optimize=True,
@@ -272,7 +315,7 @@ def compare_selection_strategies(df, insights):
     print(f"    Сгенерировано признаков: {X_train_engineered.shape[1]}")
     print(f"    Отобрано признаков: {X_test_engineered.shape[1]}")
     
-    # Обучение модели
+    # 2. Обучение модели на отобранных признаках
     model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
     model.fit(X_train_engineered.fillna(0), y_train)
     
@@ -287,7 +330,7 @@ def compare_selection_strategies(df, insights):
     print(f"    MAE (тест): {test_mae:.2f}")
     print(f"    R² (тест): {test_r2:.4f}")
     
-    # SHAP-анализ
+    # 3. SHAP-анализ важности признаков
     print("\n  SHAP-анализ важности признаков...")
     try:
         import shap
@@ -300,7 +343,7 @@ def compare_selection_strategies(df, insights):
         model_shap.fit(X_sample, y_sample)
         
         explainer = shap.TreeExplainer(model_shap)
-        shap_values = explainer(X_sample)
+        shap_values = explainer.shap_values(X_sample)
         
         shap.summary_plot(
             shap_values,
@@ -312,9 +355,9 @@ def compare_selection_strategies(df, insights):
         plt.tight_layout()
         plt.savefig("shap_feature_importance.png", dpi=150, bbox_inches='tight')
         print("    График SHAP важности сохранен как 'shap_feature_importance.png'")
-        plt.show()
+        plt.close()  # Закрываем график, чтобы избежать предупреждений
         
-        shap_importance = np.abs(shap_values.values).mean(0)
+        shap_importance = np.abs(shap_values).mean(0)
         feature_names = X_sample.columns
         top_indices = np.argsort(shap_importance)[-10:][::-1]
         
@@ -325,7 +368,7 @@ def compare_selection_strategies(df, insights):
     except ImportError:
         print("    SHAP не установлен. Установите через: pip install shap")
     
-    # Анализ корреляций
+    # 4. Анализ корреляций между отобранными признаками
     print("\n  Анализ корреляций между отобранными признаками...")
     
     n_features_to_analyze = min(20, X_train_engineered.shape[1])
@@ -348,11 +391,77 @@ def compare_selection_strategies(df, insights):
     plt.tight_layout()
     plt.savefig("feature_correlation_matrix.png", dpi=150, bbox_inches='tight')
     print(f"    Матрица корреляций сохранена как 'feature_correlation_matrix.png'")
-    plt.show()
+    plt.close()  # Закрываем график, чтобы избежать предупреждений
     
-    # Группировка признаков
-    print("\n  Группировка признаков по типу трансформера:")
+    # 5. Сравнение линейных и нелинейных методов отбора
+    print("\n  Сравнение линейных и нелинейных методов отбора...")
     
+    # Сравниваем Pearson (линейный) и Distance Correlation (нелинейный)
+    comparison_methods = ["pearson", "distance_corr"]
+    selected_sets = compare_feature_selection_methods(
+        X=X_train_engineered,
+        y=y_train,
+        methods=comparison_methods,
+        top_k=15
+    )
+    
+    print(f"    Результаты сравнения:")
+    for method, features in selected_sets.items():
+        print(f"      {method:15s}: {len(features)} признаков")
+        if features:
+            print(f"                     Примеры: {features[:3]}{'...' if len(features) > 3 else ''}")
+    
+    # Оценка качества для каждого метода
+    model_for_comparison = RandomForestRegressor(n_estimators=50, random_state=42)
+    perf_data = []
+    for method, features in selected_sets.items():
+        if len(features) == 0:
+            continue
+        
+        X_subset = X_train_engineered[features].fillna(0)
+        scores = cross_val_score(
+            model_for_comparison, X_subset, y_train, 
+            cv=3, scoring='neg_mean_absolute_error'
+        )
+        mean_mae = -scores.mean()
+        perf_data.append({
+            "Method": method,
+            "Mean_MAE": mean_mae,
+            "Num_Features": len(features)
+        })
+    
+    perf_df = pd.DataFrame(perf_data).sort_values("Mean_MAE")
+    print(f"\n    Качество моделей по методам отбора:")
+    for _, row in perf_df.iterrows():
+        print(f"      {row['Method']:15s}: MAE = {row['Mean_MAE']:.2f}")
+    
+    # 6. Блоковая оценка эффективности групп признаков
+    print("\n  Блоковая оценка эффективности групп признаков...")
+    
+    # Создаем блоки признаков
+    feature_blocks = create_feature_blocks(X_train_engineered)
+    
+    print(f"    Блоки признаков:")
+    for block_name, features in feature_blocks.items():
+        print(f"      {block_name:20s}: {len(features):3d} признаков")
+    
+    # Оцениваем каждый блок
+    block_performance = evaluate_block_performance(
+        X=X_train_engineered,
+        y=y_train,
+        feature_blocks=feature_blocks,
+        model=RandomForestRegressor(n_estimators=50, random_state=42),
+        cv=3
+    )
+    
+    print(f"\n    Качество моделей по блокам признаков:")
+    for _, row in block_performance.iterrows():
+        print(f"      {row['Block']:20s}: MAE = {row['Mean_MAE']:.2f} ({row['Num_Features']} признаков)")
+    
+    # 7. Интерпретация отобранных признаков
+    print("\n  Интерпретация отобранных признаков...")
+    
+    # Группируем признаки по типу трансформера
     feature_groups = {}
     for col in X_train_engineered.columns:
         if "window." in col:
@@ -372,31 +481,17 @@ def compare_selection_strategies(df, insights):
             feature_groups[group] = []
         feature_groups[group].append(col)
     
+    print(f"    Признаки по типу трансформера:")
     for group_name, features in feature_groups.items():
-        print(f"    {group_name:10s}: {len(features):3d} признаков")
-    
-    # Сравнение с базовой стратегией
-    print("\n  Сравнение с базовой стратегией отбора...")
-    
-    correlations = X_train_engineered.corrwith(y_train).abs().sort_values(ascending=False)
-    top_corr_features = correlations.head(20).index.tolist()
-    
-    model_corr = RandomForestRegressor(n_estimators=50, random_state=42)
-    model_corr.fit(X_train_engineered[top_corr_features].fillna(0), y_train)
-    y_pred_corr = model_corr.predict(X_test_engineered[top_corr_features].fillna(0))
-    corr_mae = mean_absolute_error(y_test, y_pred_corr)
-    
-    print(f"    MAE (корреляция): {corr_mae:.2f}")
-    print(f"    MAE (авто-инж. + SHAP): {test_mae:.2f}")
-    print(f"    Улучшение: {((corr_mae - test_mae) / corr_mae * 100):+.2f}%")
+        print(f"      {group_name:10s}: {len(features):3d} признаков")
     
     return {
         "engineered_features_count": X_train_engineered.shape[1],
         "selected_features_count": X_test_engineered.shape[1],
         "test_mae": test_mae,
         "test_r2": test_r2,
-        "correlation_baseline_mae": corr_mae,
-        "improvement_over_baseline": ((corr_mae - test_mae) / corr_mae * 100),
+        "comparison_methods_performance": perf_df,
+        "block_performance": block_performance,
         "feature_groups": feature_groups,
     }
 
@@ -427,7 +522,7 @@ def main():
     insights = analyze_feature_selection_process(df, meta_features)
     
     # Сравнение стратегий отбора
-    comparison_results = compare_selection_strategies(df, insights)
+    comparison_results = compare_selection_strategies_with_insights(df, insights)
     
     # Финальный отчет
     print("\n" + "=" * 80)
@@ -437,13 +532,29 @@ def main():
     print(f"Отобрано признаков: {comparison_results['selected_features_count']}")
     print(f"MAE прогноза: {comparison_results['test_mae']:.2f}")
     print(f"R² прогноза: {comparison_results['test_r2']:.4f}")
-    print(f"Улучшение от автоматической инженерии: {comparison_results['improvement_over_baseline']:+.2f}%")
+    
+    print(f"\nСравнение методов отбора:")
+    perf_df = comparison_results['comparison_methods_performance']
+    if not perf_df.empty:
+        best_method = perf_df.iloc[0]['Method']
+        best_mae = perf_df.iloc[0]['Mean_MAE']
+        print(f"  Лучший метод отбора: {best_method} (MAE = {best_mae:.2f})")
+    
+    print(f"\nЭффективность блоков признаков:")
+    block_perf = comparison_results['block_performance']
+    if not block_perf.empty:
+        best_block = block_perf.iloc[0]['Block']
+        best_block_mae = block_perf.iloc[0]['Mean_MAE']
+        print(f"  Лучший блок признаков: {best_block} (MAE = {best_block_mae:.2f})")
     
     print(f"\nИнсайты о структуре ряда:")
     print(f"  Суточная сезонность: {'ДА' if insights.get('daily_seasonality', False) else 'НЕТ'}")
     print(f"  Недельная сезонность: {'ДА' if insights.get('weekly_seasonality', False) else 'НЕТ'}")
     print(f"  Стационарность: {insights.get('stationarity', 'UNKNOWN')}")
     print(f"  Сложность: {insights.get('complexity', 'UNKNOWN')}")
+    print(f"  Нормальность: {insights.get('normality', 'UNKNOWN')}")
+    print(f"  Автокорреляция: {insights.get('autocorrelation', 'UNKNOWN')}")
+    print(f"  Гомоскедастичность: {insights.get('homoskedasticity', 'UNKNOWN')}")
     
     print(f"\nКоличество признаков по типу:")
     for group, count in comparison_results['feature_groups'].items():
