@@ -74,20 +74,54 @@ def distance_correlation(x: np.ndarray, y: np.ndarray) -> float:
 
 def compare_feature_selection_methods(
     X: pd.DataFrame,
-    y: Union[pd.Series, np.ndarray],
-    methods: List[str] = ["pearson", "f_regression", "mutual_info", "distance_corr"],
-    top_k: int = 20,
-    model_for_shap: Optional[object] = None
+    y: pd.Series,
+    methods: List[str],
+    top_k: int,
+    sample_size: int = 1000  # Новый параметр для подвыборки
 ) -> Dict[str, List[str]]:
+    """Сравнивает методы отбора признаков."""
+    # Подвыборка данных
+    if len(X) > sample_size:
+        X_sample = X.sample(n=sample_size, random_state=42)
+        y_sample = y.loc[X_sample.index]
+    else:
+        X_sample = X
+        y_sample = y
+
+    selected_features = {}
+
+    for method in methods:
+        if method == "pearson":
+            correlations = X_sample.corrwith(y_sample, method="pearson")
+            top_features = correlations.abs().nlargest(top_k).index.tolist()
+        elif method == "distance_corr":
+            try:
+                from dcor import distance_correlation
+                correlations = {
+                    col: distance_correlation(X_sample[col].values, y_sample.values)
+                    for col in X_sample.columns
+                }
+                top_features = sorted(correlations, key=correlations.get, reverse=True)[:top_k]
+            except ImportError:
+                print("Модуль dcor не установлен.")
+                top_features = []
+        else:
+            raise ValueError(f"Неизвестный метод: {method}")
+
+        selected_features[method] = top_features
+
+    return selected_features
+
+
+def hybrid_feature_selection(
+    X: pd.DataFrame,
+    y: Union[pd.Series, np.ndarray],
+    methods: List[str] = ["pearson", "distance_corr"],
+    top_k: int = 20,
+    hybrid_strategy: str = "union"
+) -> List[str]:
     """
-    Сравнение различных методов отбора признаков.
-    
-    Поддерживаемые методы:
-    - "pearson": Корреляция Пирсона (линейная зависимость)
-    - "f_regression": F-статистика ANOVA
-    - "mutual_info": Взаимная информация (нелинейная зависимость)
-    - "distance_corr": Корреляция расстояний (линейная + нелинейная зависимость)
-    - "shap": SHAP важность (требует обученной модели)
+    Гибридизация методов отбора признаков.
     
     Параметры
     ----------
@@ -96,131 +130,60 @@ def compare_feature_selection_methods(
     y : pd.Series или np.ndarray
         Целевая переменная.
     methods : List[str]
-        Список методов для сравнения.
+        Методы для гибридизации (например, "pearson", "distance_corr").
     top_k : int
-        Количество признаков для отбора по каждой стратегии.
-    model_for_shap : object, опционально
-        Обученная модель для SHAP анализа.
+        Количество признаков для каждого метода.
+    hybrid_strategy : str
+        Стратегия комбинирования:
+        - "union": объединение всех признаков.
+        - "intersection": пересечение признаков.
     
     Возвращает
     ----------
-    selected_features : Dict[str, List[str]]
-        Словарь: {метод: [список отобранных признаков]}
+    selected_features : List[str]
+        Список отобранных признаков после гибридизации.
     """
-    results = {}
-    y_array = np.asarray(y)
+    # Сравнение методов
+    selected_sets = compare_feature_selection_methods(
+        X=X,
+        y=y,
+        methods=methods,
+        top_k=top_k
+    )
     
-    # Pearson correlation
-    if "pearson" in methods:
-        correlations = X.corrwith(pd.Series(y_array), method="pearson").abs().sort_values(ascending=False)
-        results["pearson"] = correlations.head(top_k).index.tolist()
+    # Гибридизация
+    if hybrid_strategy == "union":
+        selected_features = list(set.union(*[set(features) for features in selected_sets.values()]))
+    elif hybrid_strategy == "intersection":
+        selected_features = list(set.intersection(*[set(features) for features in selected_sets.values()]))
+    else:
+        raise ValueError(f"Unknown hybrid strategy: {hybrid_strategy}")
     
-    # F-regression
-    if "f_regression" in methods:
-        from sklearn.feature_selection import SelectKBest
-        selector = SelectKBest(score_func=f_regression, k=top_k)
-        X_selected = selector.fit_transform(X.fillna(0), y_array)
-        selected_mask = selector.get_support()
-        results["f_regression"] = X.columns[selected_mask].tolist()
-    
-    # Mutual Information
-    if "mutual_info" in methods:
-        mi_scores = mutual_info_regression(X.fillna(0), y_array, random_state=42)
-        mi_series = pd.Series(mi_scores, index=X.columns).sort_values(ascending=False)
-        results["mutual_info"] = mi_series.head(top_k).index.tolist()
-    
-    # Distance Correlation
-    if "distance_corr" in methods:
-        dist_corr_scores = []
-        for col in X.columns:
-            try:
-                corr = distance_correlation(X[col].fillna(0).values, y_array)
-                dist_corr_scores.append((col, corr))
-            except:
-                dist_corr_scores.append((col, 0.0))
-        
-        dist_corr_scores.sort(key=lambda x: x[1], reverse=True)
-        results["distance_corr"] = [col for col, _ in dist_corr_scores[:top_k]]
-    
-    # SHAP (требует модель)
-    if "shap" in methods and model_for_shap is not None:
-        try:
-            import shap
-            explainer = shap.LinearExplainer(model_for_shap, X.fillna(0).iloc[:100])
-            shap_values = explainer.shap_values(X.fillna(0).iloc[:100])
-            shap_importance = np.abs(shap_values).mean(0)
-            shap_feature_names = X.columns
-            top_shap_idx = np.argsort(shap_importance)[-top_k:][::-1]
-            results["shap"] = [shap_feature_names[i] for i in top_shap_idx]
-        except ImportError:
-            print("SHAP не установлен. Пропускаем SHAP-анализ.")
-        except Exception as e:
-            print(f"Ошибка при SHAP-анализе: {e}")
-    
-    return results
-
-
-def analyze_feature_intersection(
-    selected_features_dict: Dict[str, List[str]]
-) -> pd.DataFrame:
-    """
-    Анализ пересечений наборов отобранных признаков.
-    
-    Параметры
-    ----------
-    selected_features_dict : Dict[str, List[str]]
-        Результат compare_feature_selection_methods.
-    
-    Возвращает
-    ----------
-    intersection_df : pd.DataFrame
-        DataFrame с метриками пересечения между методами.
-    """
-    from itertools import combinations
-    
-    intersection_data = []
-    for method1, method2 in combinations(selected_features_dict.keys(), 2):
-        set1 = set(selected_features_dict[method1])
-        set2 = set(selected_features_dict[method2])
-        intersection = len(set1 & set2)
-        union = len(set1 | set2)
-        jaccard = intersection / union if union > 0 else 0
-        
-        intersection_data.append({
-            "Method_1": method1,
-            "Method_2": method2,
-            "Intersection_Count": intersection,
-            "Union_Count": union,
-            "Jaccard_Similarity": jaccard
-        })
-    
-    return pd.DataFrame(intersection_data)
-
+    return selected_features
 
 def plot_correlation_matrix(
     X: pd.DataFrame,
-    features: List[str],
     title: str = "Матрица корреляций",
+    figsize: tuple = (10, 8),
     save_path: Optional[str] = None
 ):
     """
-    Построение матрицы корреляций для подмножества признаков.
+    Визуализация матрицы корреляций между признаками.
     
     Параметры
     ----------
     X : pd.DataFrame
-        Признаковое пространство.
-    features : List[str]
-        Список признаков для анализа.
-    title : str
+        DataFrame с признаками.
+    title : str, по умолчанию "Матрица корреляций"
         Заголовок графика.
+    figsize : tuple, по умолчанию (10, 8)
+        Размер графика.
     save_path : str, опционально
         Путь для сохранения графика.
     """
-    X_subset = X[features].fillna(0)
-    corr_matrix = X_subset.corr()
+    corr_matrix = X.corr()
     
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=figsize)
     sns.heatmap(
         corr_matrix,
         annot=True,
@@ -235,7 +198,7 @@ def plot_correlation_matrix(
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  График сохранен как '{save_path}'")
+        print(f"График сохранен как '{save_path}'")
     
     plt.show()
 
@@ -244,23 +207,20 @@ def evaluate_block_performance(
     X: pd.DataFrame,
     y: Union[pd.Series, np.ndarray],
     feature_blocks: Dict[str, List[str]],
-    model=None,
+    model: object = None,
     cv: int = 3
 ) -> pd.DataFrame:
     """
     Оценка качества модели по блокам признаков.
     
-    Вместо оценки каждого метода отбора отдельно, оцениваются
-    предопределенные блоки признаков (например, оконные, спектральные).
-    
     Параметры
     ----------
     X : pd.DataFrame
-        Исходное признаковое пространство.
+        Признаковое пространство.
     y : pd.Series или np.ndarray
         Целевая переменная.
     feature_blocks : Dict[str, List[str]]
-        Словарь: {название_блока: [список_признаков]}.
+        Словарь блоков признаков.
     model : object
         Модель для оценки (по умолчанию Ridge).
     cv : int
@@ -281,12 +241,7 @@ def evaluate_block_performance(
         if len(features) == 0:
             continue
         
-        # Проверяем, что все признаки существуют в X
-        valid_features = [f for f in features if f in X.columns]
-        if len(valid_features) == 0:
-            continue
-        
-        X_subset = X[valid_features].fillna(0)
+        X_subset = X[features].fillna(0)
         scores = cross_val_score(model, X_subset, y_array, cv=cv, scoring='neg_mean_absolute_error')
         mean_mae = -scores.mean()
         std_mae = scores.std()
@@ -295,7 +250,7 @@ def evaluate_block_performance(
             "Block": block_name,
             "Mean_MAE": mean_mae,
             "Std_MAE": std_mae,
-            "Num_Features": len(valid_features)
+            "Num_Features": len(features)
         })
     
     if not perf_data:
@@ -303,62 +258,38 @@ def evaluate_block_performance(
     
     return pd.DataFrame(perf_data).sort_values("Mean_MAE")
 
-
-def evaluate_selection_impact(
-    X: pd.DataFrame,
-    y: Union[pd.Series, np.ndarray],
-    selected_features_dict: Dict[str, List[str]],
-    model=None,
-    cv: int = 3
-) -> pd.DataFrame:
+def analyze_feature_intersection(
+    selected_sets: Dict[str, List[str]]
+) -> Dict[str, List[str]]:
     """
-    Оценка влияния отбора признаков на качество модели.
+    Анализ пересечений наборов признаков, отобранных разными методами.
     
     Параметры
     ----------
-    X : pd.DataFrame
-        Исходное признаковое пространство.
-    y : pd.Series или np.ndarray
-        Целевая переменная.
-    selected_features_dict : Dict[str, List[str]]
-        Результат compare_feature_selection_methods.
-    model : object
-        Модель для оценки (по умолчанию Ridge).
-    cv : int
-        Количество фолдов кросс-валидации.
+    selected_sets : Dict[str, List[str]]
+        Словарь: {метод: [список отобранных признаков]}.
     
     Возвращает
     ----------
-    performance_df : pd.DataFrame
-        DataFrame с метриками качества для каждого метода отбора.
+    intersection_results : Dict[str, List[str]]
+        Словарь с результатами анализа пересечений.
     """
-    if model is None:
-        model = Ridge(alpha=1.0, random_state=42)
+    methods = list(selected_sets.keys())
+    intersection_results = {}
     
-    perf_data = []
-    y_array = np.asarray(y)
+    # Полное пересечение всех методов
+    full_intersection = set.intersection(*[set(features) for features in selected_sets.values()])
+    intersection_results["full_intersection"] = list(full_intersection)
     
-    for method, features in selected_features_dict.items():
-        if len(features) == 0:
-            continue
-        
-        X_subset = X[features].fillna(0)
-        scores = cross_val_score(model, X_subset, y_array, cv=cv, scoring='neg_mean_absolute_error')
-        mean_mae = -scores.mean()
-        std_mae = scores.std()
-        
-        perf_data.append({
-            "Method": method,
-            "Mean_MAE": mean_mae,
-            "Std_MAE": std_mae,
-            "Num_Features": len(features)
-        })
+    # Попарные пересечения
+    for i in range(len(methods)):
+        for j in range(i + 1, len(methods)):
+            method1 = methods[i]
+            method2 = methods[j]
+            intersection = set(selected_sets[method1]).intersection(set(selected_sets[method2]))
+            intersection_results[f"{method1}_and_{method2}"] = list(intersection)
     
-    if not perf_data:
-        return pd.DataFrame(columns=["Method", "Mean_MAE", "Std_MAE", "Num_Features"])
-    
-    return pd.DataFrame(perf_data).sort_values("Mean_MAE")
-
+    return intersection_results
 
 def create_feature_blocks(X: pd.DataFrame) -> Dict[str, List[str]]:
     """

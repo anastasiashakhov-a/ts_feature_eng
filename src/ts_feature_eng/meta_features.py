@@ -1,4 +1,5 @@
 # src/ts_feature_eng/meta_features.py
+
 """
 Модуль для извлечения мета-признаков временных рядов.
 
@@ -200,9 +201,9 @@ class MetaFeatureExtractor:
         if self.fill_method == "linear":
             X_filled = X_filled.interpolate(method="linear", limit_direction="both")
         elif self.fill_method == "forward":
-            X_filled = X_filled.fillna(method="ffill").fillna(method="bfill")
+            X_filled = X_filled.ffill().bfill()
         elif self.fill_method == "backward":
-            X_filled = X_filled.fillna(method="bfill").fillna(method="ffill")
+            X_filled = X_filled.bfill().ffill()
         
         # Заполняем оставшиеся пропуски средним значением
         for col in X_filled.columns:
@@ -408,7 +409,7 @@ class MetaFeatureExtractor:
             # Простая нелинейная модель (скользящее среднее)
             window_size = min(10, len(series) // 10)
             if window_size > 1:
-                nonlinear_pred = pd.Series(series).rolling(window=window_size, center=True).mean().fillna(method='bfill').fillna(method='ffill').values
+                nonlinear_pred = pd.Series(series).rolling(window=window_size, center=True).mean().ffill().bfill().values
                 nonlinear_mae = mean_absolute_error(series, nonlinear_pred)
                 # Меньшая ошибка нелинейной модели указывает на нелинейность
                 features["nonlinearity"] = float((linear_mae - nonlinear_mae) / linear_mae)
@@ -591,3 +592,25 @@ class MetaFeatureExtractor:
         if self.meta_features_ is None:
             raise ValueError("MetaFeatureExtractor has not been fitted yet.")
         return list(self.meta_features_.keys())
+    
+    def recommend_hybrid_strategy(self, meta_features: Dict[str, float]) -> str:
+        """
+        Рекомендация стратегии гибридизации на основе мета-признаков.
+        
+        Параметры
+        ----------
+        meta_features : Dict[str, float]
+            Словарь мета-признаков временного ряда.
+        
+        Возвращает
+        ----------
+        strategy : str
+            Рекомендуемая стратегия ("union", "intersection").
+        """
+        linearity = meta_features.get("linearity", 0)
+        complexity = meta_features.get("permutation_entropy", 0)
+        
+        if linearity > 0.5 and complexity < 0.8:
+            return "intersection"  # Линейные зависимости преобладают
+        else:
+            return "union"  # Нелинейные зависимости важны

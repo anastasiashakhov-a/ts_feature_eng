@@ -31,7 +31,8 @@ from ts_feature_eng.analysis import (
     analyze_feature_intersection,
     plot_correlation_matrix,
     evaluate_block_performance,
-    create_feature_blocks
+    create_feature_blocks,
+    hybrid_feature_selection  # Новая функция для гибридизации
 )
 
 
@@ -458,7 +459,33 @@ def compare_selection_strategies_with_insights(df, insights):
     for _, row in block_performance.iterrows():
         print(f"      {row['Block']:20s}: MAE = {row['Mean_MAE']:.2f} ({row['Num_Features']} признаков)")
     
-    # 7. Интерпретация отобранных признаков
+    # 7. Гибридизация методов отбора
+    print("\n  Гибридизация методов отбора...")
+    hybrid_strategy = "union"  # Можно адаптировать на основе мета-признаков
+    hybrid_features = hybrid_feature_selection(
+        X=X_train_engineered,
+        y=y_train,
+        methods=["pearson", "distance_corr"],
+        top_k=15,
+        hybrid_strategy=hybrid_strategy
+    )
+    print(f"    Гибридизация ({hybrid_strategy}): {len(hybrid_features)} признаков")
+    print(f"                     Примеры: {hybrid_features[:3]}{'...' if len(hybrid_features) > 3 else ''}")
+    
+    # Оценка качества гибридного набора
+    if hybrid_features:
+        X_hybrid = X_train_engineered[hybrid_features].fillna(0)
+        hybrid_scores = cross_val_score(
+            model_for_comparison, X_hybrid, y_train,
+            cv=3, scoring='neg_mean_absolute_error'
+        )
+        hybrid_mae = -hybrid_scores.mean()
+        print(f"    MAE (гибридный набор): {hybrid_mae:.2f}")
+    else:
+        hybrid_mae = np.nan
+        print("    Гибридный набор пуст.")
+    
+    # 8. Интерпретация отобранных признаков
     print("\n  Интерпретация отобранных признаков...")
     
     # Группируем признаки по типу трансформера
@@ -492,6 +519,11 @@ def compare_selection_strategies_with_insights(df, insights):
         "test_r2": test_r2,
         "comparison_methods_performance": perf_df,
         "block_performance": block_performance,
+        "hybrid_performance": {
+            "Method": f"hybrid_{hybrid_strategy}",
+            "Mean_MAE": hybrid_mae,
+            "Num_Features": len(hybrid_features)
+        },
         "feature_groups": feature_groups,
     }
 
@@ -546,6 +578,10 @@ def main():
         best_block = block_perf.iloc[0]['Block']
         best_block_mae = block_perf.iloc[0]['Mean_MAE']
         print(f"  Лучший блок признаков: {best_block} (MAE = {best_block_mae:.2f})")
+    
+    print(f"\nГибридизация методов:")
+    hybrid_perf = comparison_results['hybrid_performance']
+    print(f"  Гибридный набор ({hybrid_perf['Method']}): MAE = {hybrid_perf['Mean_MAE']:.2f} ({hybrid_perf['Num_Features']} признаков)")
     
     print(f"\nИнсайты о структуре ряда:")
     print(f"  Суточная сезонность: {'ДА' if insights.get('daily_seasonality', False) else 'НЕТ'}")
