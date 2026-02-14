@@ -17,6 +17,8 @@ dependencies = [
     "pytest>=9.0.2",
     "seaborn>=0.13.2",
     "shap>=0.49.1",
+    "docr>=0.2.1",
+    "dcor>=0.7",
 ]
 requires-python = ">=3.10"      # Обновлено для совместимости с современными пакетами
 readme = "README.md"
