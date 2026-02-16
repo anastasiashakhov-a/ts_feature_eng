@@ -36,7 +36,7 @@ class DWTTransformer(TimeSeriesTransformer):
         - Daubechies: "db1"-"db20"
         - Symlets: "sym2"-"sym20"
         - Coiflets: "coif1"-"coif5"
-        Полный список: https://pywavelets.readthedocs.io/en/latest/ref/wavelets.html
+        Полный список: https://pywavelets.readthedocs.io/en/latest/ref/wavelets.html  
     max_level : int, опционально
         Максимальный уровень декомпозиции. Если не указан, вычисляется автоматически
         как floor(log2(n_samples)).
@@ -147,6 +147,17 @@ class DWTTransformer(TimeSeriesTransformer):
                 f"with wavelet '{self.wavelet}'. Minimum required: 2 samples."
             )
         
+        # Создание имен признаков
+        self.feature_names_ = []
+        for col in X.columns:
+            for level in range(1, self.n_levels_ + 1):
+                for stat in self.statistics:
+                    # Признаки для детализации (high-frequency)
+                    self.feature_names_.append(f"{col}.dwt.level_{level}.detail.{stat}")
+                    # Признаки для аппроксимации (low-frequency) - только на последнем уровне
+                    if level == self.n_levels_:
+                        self.feature_names_.append(f"{col}.dwt.level_{level}.approx.{stat}")
+        
         self.is_fitted_ = True
         return self
     
@@ -169,7 +180,6 @@ class DWTTransformer(TimeSeriesTransformer):
         
         X = self._validate_input(X)
         features = {}
-        feature_names = []
         
         # Обработка каждого столбца
         for col in X.columns:
@@ -183,24 +193,20 @@ class DWTTransformer(TimeSeriesTransformer):
             for level in range(1, self.n_levels_ + 1):
                 # Коэффициенты детализации для текущего уровня
                 detail_coeffs = coeffs[-level]
-                approx_coeffs = coeffs[0] if level == self.n_levels_ else None
                 
                 # Статистики для детализации
                 for stat in self.statistics:
                     feat_name = f"{col}.dwt.level_{level}.detail.{stat}"
                     features[feat_name] = self._compute_wavelet_statistic(detail_coeffs, stat)
-                    feature_names.append(feat_name)
                 
                 # Статистики для аппроксимации (только на самом высоком уровне)
-                if level == self.n_levels_ and approx_coeffs is not None:
+                if level == self.n_levels_:
+                    approx_coeffs = coeffs[0]
                     for stat in self.statistics:
                         feat_name = f"{col}.dwt.level_{level}.approx.{stat}"
                         features[feat_name] = self._compute_wavelet_statistic(approx_coeffs, stat)
-                        feature_names.append(feat_name)
         
         X_transformed = pd.DataFrame(features, index=X.index)
-        self.feature_names_ = feature_names
-        
         return X_transformed
     
     def _compute_wavelet_statistic(self, coeffs: np.ndarray, statistic: str) -> float:
@@ -263,19 +269,24 @@ class DWTTransformer(TimeSeriesTransformer):
         else:
             raise ValueError(f"Unknown statistic: {statistic}")
     
-    def get_feature_names(self) -> List[str]:
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """
         Получение имен сгенерированных признаков.
         
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        
         Возвращает
         ----------
-        feature_names : List[str]
-            Список имен признаков.
+        feature_names : np.ndarray
+            Массив имен сгенерированных признаков.
         """
         if not self.is_fitted_:
-            raise ValueError("Transformer is not fitted. Call fit() first.")
+            raise ValueError("DWTTransformer is not fitted. Call fit() first.")
         
-        return self.feature_names_
+        return np.array(self.feature_names_)
 
 
 class STLTransformer(TimeSeriesTransformer):
@@ -416,6 +427,13 @@ class STLTransformer(TimeSeriesTransformer):
         else:
             self.trend_ = self.trend
         
+        # Создание имен признаков
+        self.feature_names_ = []
+        for col in X.columns:
+            for component in ["trend", "seasonal", "resid"]:
+                for stat in self.statistics:
+                    self.feature_names_.append(f"{col}.stl.{component}.{stat}")
+        
         self.is_fitted_ = True
         return self
     
@@ -475,7 +493,6 @@ class STLTransformer(TimeSeriesTransformer):
         
         X = self._validate_input(X)
         features = {}
-        feature_names = []
         
         # Обработка каждого столбца
         for col in X.columns:
@@ -517,11 +534,8 @@ class STLTransformer(TimeSeriesTransformer):
                 for stat in self.statistics:
                     feat_name = f"{col}.stl.{component_name}.{stat}"
                     features[feat_name] = self._compute_component_statistic(component, stat)
-                    feature_names.append(feat_name)
         
         X_transformed = pd.DataFrame(features, index=X.index)
-        self.feature_names_ = feature_names
-        
         return X_transformed
     
     def _compute_component_statistic(self, component: pd.Series, statistic: str) -> float:
@@ -573,19 +587,24 @@ class STLTransformer(TimeSeriesTransformer):
         else:
             raise ValueError(f"Unknown statistic: {statistic}")
     
-    def get_feature_names(self) -> List[str]:
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """
         Получение имен сгенерированных признаков.
         
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        
         Возвращает
         ----------
-        feature_names : List[str]
-            Список имен признаков.
+        feature_names : np.ndarray
+            Массив имен сгенерированных признаков.
         """
         if not self.is_fitted_:
-            raise ValueError("Transformer is not fitted. Call fit() first.")
+            raise ValueError("STLTransformer is not fitted. Call fit() first.")
         
-        return self.feature_names_
+        return np.array(self.feature_names_)
     
     def get_params(self, deep: bool = True) -> dict:
         """

@@ -26,7 +26,7 @@ class TimeSeriesTransformer(BaseEstimator, TransformerMixin, ABC):
     Все трансформеры должны реализовывать методы:
     - fit: обучение на данных (может быть пустым для stateless-трансформеров)
     - transform: применение преобразования к данным
-    - get_feature_names: получение имен сгенерированных признаков
+    - get_feature_names_out: получение имен сгенерированных признаков
     
     Поддерживает интерфейс scikit-learn (BaseEstimator + TransformerMixin),
     что позволяет использовать трансформеры в пайплайнах sklearn.
@@ -77,14 +77,19 @@ class TimeSeriesTransformer(BaseEstimator, TransformerMixin, ABC):
         pass
     
     @abstractmethod
-    def get_feature_names(self) -> List[str]:
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """
         Получение имен сгенерированных признаков.
         
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn)
+        
         Возвращает
         ----------
-        feature_names : List[str]
-            Список имен признаков в порядке их генерации
+        feature_names : np.ndarray
+            Массив имен признаков в порядке их генерации
         """
         pass
     
@@ -109,26 +114,6 @@ class TimeSeriesTransformer(BaseEstimator, TransformerMixin, ABC):
             DataFrame с сгенерированными признаками
         """
         return self.fit(X, y).transform(X)
-    
-    def get_feature_names_out(self, input_features=None) -> np.ndarray:
-        """
-        Совместимость с интерфейсом scikit-learn 1.0+.
-        
-        Возвращает имена признаков в формате numpy array.
-        
-        Параметры
-        ----------
-        input_features : array-like, опционально
-            Игнорируется (требуется для совместимости с интерфейсом sklearn)
-        
-        Возвращает
-        ----------
-        feature_names : np.ndarray
-            Массив имен признаков
-        """
-        if not self.is_fitted_:
-            raise TimeSeriesError("Transformer is not fitted. Call fit() first.")
-        return np.array(self.get_feature_names())
     
     def _validate_input(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
         """
@@ -301,7 +286,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin, ABC):
         
         if indices:
             return np.where(mask)[0]
-        return mask
+        return np.array(mask)
     
     def _validate_input(
         self,

@@ -265,7 +265,12 @@ class MetaFeatureExtractor:
                 "normality_shapiro": np.nan,
                 "normality_jarque": np.nan,
                 "autocorrelation_ljungbox": np.nan,
-                "homoskedasticity_bp": np.nan
+                "homoskedasticity_bp": np.nan,
+                "acf_1": np.nan,
+                "acf_24": np.nan,
+                "acf_168": np.nan,
+                "acf_30": np.nan,
+                "acf_365": np.nan
             }
         
         # Тест на стационарность (ADF)
@@ -357,6 +362,24 @@ class MetaFeatureExtractor:
         except:
             features["homoskedasticity_bp"] = np.nan
         
+        # Автокорреляции для разных горизонтов
+        try:
+            from statsmodels.tsa.stattools import acf
+            max_lag = min(len(series) // 2, 400)
+            acf_vals = acf(series, nlags=max_lag, fft=True)
+            
+            features["acf_1"] = float(acf_vals[1]) if len(acf_vals) > 1 else np.nan
+            features["acf_24"] = float(acf_vals[24]) if len(acf_vals) > 24 else np.nan
+            features["acf_168"] = float(acf_vals[168]) if len(acf_vals) > 168 else np.nan
+            features["acf_30"] = float(acf_vals[30]) if len(acf_vals) > 30 else np.nan
+            features["acf_365"] = float(acf_vals[365]) if len(acf_vals) > 365 else np.nan
+        except:
+            features["acf_1"] = np.nan
+            features["acf_24"] = np.nan
+            features["acf_168"] = np.nan
+            features["acf_30"] = np.nan
+            features["acf_365"] = np.nan
+        
         return features
     
     def _extract_information_theoretic_features(self, X: pd.DataFrame) -> Dict[str, float]:
@@ -447,19 +470,6 @@ class MetaFeatureExtractor:
         except:
             features["dominant_freq"] = np.nan
         
-        # Автокорреляции
-        try:
-            from statsmodels.tsa.stattools import acf
-            max_lag = min(len(series) // 2, 200)
-            acf_vals = acf(series, nlags=max_lag, fft=True)
-            features["acf_1"] = float(acf_vals[1]) if len(acf_vals) > 1 else np.nan
-            features["acf_24"] = float(acf_vals[24]) if len(acf_vals) > 24 else np.nan
-            features["acf_168"] = float(acf_vals[168]) if len(acf_vals) > 168 else np.nan
-        except:
-            features["acf_1"] = np.nan
-            features["acf_24"] = np.nan
-            features["acf_168"] = np.nan
-        
         # Спектральная энтропия
         try:
             if 'power_spectrum' in locals():
@@ -508,10 +518,14 @@ class MetaFeatureExtractor:
         
         # Сезонный наивный прогноз (значение 24 периода назад)
         try:
-            seasonal_naive_pred = np.roll(y_subset, 24)
-            seasonal_naive_pred[:24] = y_subset[:24]  # Первые 24 значений берем как есть
-            seasonal_naive_mae = mean_absolute_error(y_subset, seasonal_naive_pred)
-            features["seasonal_naive_error"] = float(seasonal_naive_mae)
+            seasonal_lag = 24
+            if len(y_subset) > seasonal_lag:
+                seasonal_naive_pred = np.roll(y_subset, seasonal_lag)
+                seasonal_naive_pred[:seasonal_lag] = y_subset[:seasonal_lag]  # Первые значения берем как есть
+                seasonal_naive_mae = mean_absolute_error(y_subset, seasonal_naive_pred)
+                features["seasonal_naive_error"] = float(seasonal_naive_mae)
+            else:
+                features["seasonal_naive_error"] = np.nan
         except:
             features["seasonal_naive_error"] = np.nan
         
@@ -593,9 +607,9 @@ class MetaFeatureExtractor:
             raise ValueError("MetaFeatureExtractor has not been fitted yet.")
         return list(self.meta_features_.keys())
     
-    def recommend_hybrid_strategy(self, meta_features: Dict[str, float]) -> str:
+    def recommend_core_features(self, meta_features: Dict[str, float]) -> Dict[str, bool]:
         """
-        Рекомендация стратегии гибридизации на основе мета-признаков.
+        Рекомендация обязательных признаков на основе мета-признаков.
         
         Параметры
         ----------
@@ -604,13 +618,42 @@ class MetaFeatureExtractor:
         
         Возвращает
         ----------
-        strategy : str
-            Рекомендуемая стратегия ("union", "intersection").
+        recommendations : Dict[str, bool]
+            Рекомендации по включению обязательных признаков:
+            - "include_lags": Включать ли лаги
+            - "include_rolling": Включать ли rolling-статистики
+            - "min_lag": Минимальный лаг для включения
+            - "max_lag": Максимальный лаг для включения
         """
-        linearity = meta_features.get("linearity", 0)
-        complexity = meta_features.get("permutation_entropy", 0)
+        recommendations = {
+            "include_lags": False,
+            "include_rolling": False,
+            "min_lag": 1,
+            "max_lag": 1
+        }
         
-        if linearity > 0.5 and complexity < 0.8:
-            return "intersection"  # Линейные зависимости преобладают
-        else:
-            return "union"  # Нелинейные зависимости важны
+        # Анализ автокорреляции для рекомендации лагов
+        acf_1 = meta_features.get("acf_1", 0)
+        acf_24 = meta_features.get("acf_24", 0)
+        acf_168 = meta_features.get("acf_168", 0)
+        acf_365 = meta_features.get("acf_365", 0)
+        
+        # Если есть значимая автокорреляция на лаге 1, включаем лаги
+        if abs(acf_1) > 0.1:
+            recommendations["include_lags"] = True
+            recommendations["min_lag"] = 1
+            
+            # Определяем максимальный лаг на основе значимых ACF
+            if abs(acf_365) > 0.1:
+                recommendations["max_lag"] = 365
+            elif abs(acf_168) > 0.1:
+                recommendations["max_lag"] = 168
+            elif abs(acf_24) > 0.1:
+                recommendations["max_lag"] = 24
+            else:
+                recommendations["max_lag"] = 1
+        
+        # Всегда включаем rolling-статистики для временных рядов
+        recommendations["include_rolling"] = True
+        
+        return recommendations

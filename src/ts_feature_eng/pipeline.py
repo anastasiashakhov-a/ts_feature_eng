@@ -18,9 +18,9 @@ from .meta_features import MetaFeatureExtractor
 from .optimization import FeatureEngineeringOptimizer, FeatureEngineeringPipeline
 from .selection import CombinedFeatureSelector
 from .transformers.window import WindowTransformer
+from .transformers.lag import LagTransformer
 from .transformers.spectral import DWTTransformer, STLTransformer
 from .transformers.time_encoding import TimeEncodingTransformer, CalendarFeaturesTransformer
-
 
 class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
     """
@@ -194,7 +194,10 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             print(f"Извлечено {len(self.meta_features_)} мета-признаков")
             print(f"Ключевые мета-признаки: {list(self.meta_features_.keys())[:5]}")
         
-        # Шаг 2: Поиск оптимального пайплайна
+        # Шаг 2: Создание core pipeline (обязательные признаки)
+        core_pipeline = self._create_core_pipeline(X, y)
+        
+        # Шаг 3: Поиск оптимального auto pipeline (если требуется)
         if self.optimize:
             if self.verbose >= 1:
                 print(f"Запуск байесовской оптимизации ({self.n_calls} итераций)...")
@@ -210,17 +213,21 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 verbose=self.verbose >= 2
             )
             
-            # Запускаем оптимизацию
-            best_pipeline, best_params, best_score = optimizer.optimize(
+            # Запускаем оптимизацию только для auto-компонентов
+            best_auto_pipeline, best_params, best_score = optimizer.optimize(
                 X, y, meta_features=self.meta_features_
             )
             
-            self.best_pipeline_ = best_pipeline
+            # Комбинируем core и auto пайплайны
+            combined_transformers = core_pipeline.transformers + best_auto_pipeline.transformers
+            self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
+            
             self.optimization_history_ = optimizer.get_search_history()
             
             if self.verbose >= 1:
                 print(f"Оптимизация завершена. Лучшая метрика: {best_score:.4f}")
-                print(f"Активные трансформеры: {[name for name, _, active in best_pipeline.transformers if active]}")
+                active_transformers = [name for name, _, active in combined_transformers if active]
+                print(f"Активные трансформеры: {active_transformers}")
         
         else:
             # Используем фиксированный пайплайн по умолчанию
@@ -228,12 +235,14 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 print("Использование фиксированного пайплайна по умолчанию (без оптимизации)...")
             
             # Создаем разумный пайплайн по умолчанию на основе мета-признаков
-            self.best_pipeline_ = self._create_default_pipeline(X)
+            default_pipeline = self._create_default_pipeline(X)
+            combined_transformers = core_pipeline.transformers + default_pipeline.transformers
+            self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
             
             if self.verbose >= 1:
                 print("Фиксированный пайплайн создан")
         
-        # Шаг 3: Применение постфильтрации признаков
+        # Шаг 4: Применение постфильтрации признаков
         if self.apply_selection:
             if self.verbose >= 1:
                 print("Применение постфильтрации признаков...")
@@ -451,6 +460,59 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 )
         
         return X, y
+    
+    def _create_core_pipeline(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> FeatureEngineeringPipeline:
+        """Создание core пайплайна с обязательными признаками (лаги + rolling)."""
+        n_samples = len(X)
+        has_time_index = isinstance(X.index, pd.DatetimeIndex)
+        
+        # Определяем лаги на основе частоты данных
+        lags = []
+        if has_time_index:
+            freq = pd.infer_freq(X.index)
+            if freq and 'T' in freq:  # минутная частота
+                lags = [1, 4, 96, 672]  # 15 мин, 1 час, 24 часа, 7 дней
+            elif freq and 'H' in freq:  # часовая частота
+                lags = [1, 24, 168]      # 1 час, 24 часа, 7 дней
+            elif freq and 'D' in freq:  # дневная частота
+                lags = [1, 7, 30, 365]   # 1 день, неделя, месяц, год
+            else:
+                lags = [1, min(24, n_samples//10), min(168, n_samples//2)]
+        else:
+            # Для не временных индексов используем относительные лаги
+            lags = [1, min(10, n_samples//20), min(50, n_samples//5)]
+        
+        # Фильтруем лаги, которые возможны для данного размера данных
+        lags = [lag for lag in lags if lag < n_samples]
+        
+        transformers = []
+        
+        # Добавляем обязательные лаги
+        if lags:
+            transformers.append(
+                (
+                    "core_lags",
+                    LagTransformer(lags=lags),
+                    True
+                )
+            )
+        
+        # Добавляем rolling-статистики
+        if lags:
+            window_size = max(lags) + 1
+            transformers.append(
+                (
+                    "core_rolling",
+                    WindowTransformer(
+                        window_size=window_size,
+                        transformations=["identity"],
+                        statistics=["mean", "std", "min", "max"]
+                    ),
+                    True
+                )
+            )
+        
+        return FeatureEngineeringPipeline(transformers)
     
     def _create_default_pipeline(self, X: pd.DataFrame) -> FeatureEngineeringPipeline:
         """

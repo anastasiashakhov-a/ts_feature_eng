@@ -12,12 +12,12 @@
 в пайплайнах как самостоятельные компоненты или в комбинации.
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.feature_selection import VarianceThreshold as SklearnVarianceThreshold
+from sklearn.feature_selection import VarianceThreshold as SklearnVarianceThreshold, SelectKBest, f_regression, mutual_info_regression
 
 from .base import FeatureSelector, TimeSeriesError
 
@@ -687,6 +687,266 @@ class SHAPFeatureSelector(FeatureSelector):
         return importance_df.reset_index(drop=True)
 
 
+class HybridFeatureSelector(FeatureSelector):
+    """
+    Гибридный селектор признаков, комбинирующий несколько стратегий отбора.
+    
+    Поддерживает следующие стратегии:
+    - "union": объединение признаков из всех методов
+    - "intersection": пересечение признаков из всех методов
+    - "staged": последовательное применение методов (фильтрация → модель → SHAP)
+    
+    Параметры
+    ----------
+    methods : List[str], по умолчанию ["pearson", "distance_corr"]
+        Список методов для гибридизации:
+        - "pearson": корреляция Пирсона
+        - "f_regression": F-статистика ANOVA  
+        - "mutual_info": взаимная информация
+        - "distance_corr": корреляция расстояний
+    strategy : str, по умолчанию "union"
+        Стратегия комбинирования:
+        - "union": объединение всех признаков
+        - "intersection": пересечение признаков
+        - "staged": многоступенчатый отбор
+    top_k : int, по умолчанию 20
+        Количество признаков для каждого метода.
+    model : object, опционально
+        Модель для staged-стратегии (по умолчанию Ridge).
+    random_state : int, опционально
+        Фиксация случайного состояния.
+    
+    Атрибуты
+    ----------
+    selected_features_ : List[str]
+        Список отобранных признаков.
+    feature_importances_ : Dict[str, List[float]]
+        Важность признаков по каждому методу.
+    is_fitted_ : bool
+        Флаг, указывающий, был ли вызван метод fit().
+    
+    Примеры
+    --------
+    >>> import pandas as pd
+    >>> import numpy as np
+    >>> from ts_feature_eng.selection import HybridFeatureSelector
+    >>> 
+    >>> X = pd.DataFrame(np.random.randn(1000, 20), columns=[f"f{i}" for i in range(20)])
+    >>> y = X["f0"] * 2 + X["f1"] * 1.5 + np.random.randn(1000) * 0.1
+    >>> 
+    >>> selector = HybridFeatureSelector(
+    ...     methods=["pearson", "distance_corr"],
+    ...     strategy="union",
+    ...     top_k=10
+    ... )
+    >>> X_selected = selector.fit_transform(X, y)
+    >>> 
+    >>> print(f"Отобрано признаков: {len(X_selected.columns)}")
+    """
+    
+    def __init__(
+        self,
+        methods: List[str] = None,
+        strategy: str = "union",
+        top_k: int = 20,
+        model: Optional[object] = None,
+        random_state: Optional[int] = 42,
+    ):
+        super().__init__()
+        self.methods = methods or ["pearson", "distance_corr"]
+        self.strategy = strategy
+        self.top_k = top_k
+        self.model = model
+        self.random_state = random_state
+        
+        valid_strategies = {"union", "intersection", "staged"}
+        if strategy not in valid_strategies:
+            raise ValueError(f"strategy must be one of {valid_strategies}, got {strategy}")
+        
+        valid_methods = {"pearson", "f_regression", "mutual_info", "distance_corr"}
+        invalid_methods = set(self.methods) - valid_methods
+        if invalid_methods:
+            raise ValueError(f"Invalid methods: {invalid_methods}. Valid options: {valid_methods}")
+    
+    def fit(self, X: pd.DataFrame, y: Union[pd.Series, np.ndarray]) -> "HybridFeatureSelector":
+        """
+        Применение гибридной стратегии отбора признаков.
+        
+        Параметры
+        ----------
+        X : pd.DataFrame
+            DataFrame с признаками.
+        y : pd.Series или np.ndarray
+            Целевая переменная.
+        
+        Возвращает
+        ----------
+        self : HybridFeatureSelector
+            Обученный селектор.
+        """
+        X, y = self._validate_input(X, y)
+        
+        # Вычисление признаков по каждому методу
+        self.feature_sets_ = {}
+        self.feature_importances_ = {}
+        
+        for method in self.methods:
+            if method == "pearson":
+                correlations = X.corrwith(y).abs()
+                top_features = correlations.nlargest(self.top_k).index.tolist()
+                self.feature_sets_[method] = top_features
+                self.feature_importances_[method] = correlations[top_features].tolist()
+                
+            elif method == "f_regression":
+                selector = SelectKBest(score_func=f_regression, k=self.top_k)
+                selector.fit(X.fillna(0), y)
+                selected_mask = selector.get_support()
+                self.feature_sets_[method] = X.columns[selected_mask].tolist()
+                self.feature_importances_[method] = selector.scores_[selected_mask].tolist()
+                
+            elif method == "mutual_info":
+                mi_scores = mutual_info_regression(X.fillna(0), y, random_state=self.random_state)
+                top_indices = np.argsort(mi_scores)[-self.top_k:][::-1]
+                self.feature_sets_[method] = X.columns[top_indices].tolist()
+                self.feature_importances_[method] = mi_scores[top_indices].tolist()
+                
+            elif method == "distance_corr":
+                try:
+                    from dcor import distance_correlation
+                    correlations = {}
+                    for col in X.columns:
+                        corr = distance_correlation(X[col].fillna(0).values, y.values)
+                        correlations[col] = corr
+                    sorted_features = sorted(correlations.items(), key=lambda x: x[1], reverse=True)
+                    self.feature_sets_[method] = [feat for feat, _ in sorted_features[:self.top_k]]
+                    self.feature_importances_[method] = [corr for _, corr in sorted_features[:self.top_k]]
+                except ImportError:
+                    # Резервный метод: используем Pearson вместо distance correlation
+                    correlations = X.corrwith(y).abs()
+                    top_features = correlations.nlargest(self.top_k).index.tolist()
+                    self.feature_sets_[method] = top_features
+                    self.feature_importances_[method] = correlations[top_features].tolist()
+                    if hasattr(self, "logger"):
+                        self.logger.warning("dcor not installed. Using Pearson correlation as fallback for distance_corr.")
+        
+        # Применение стратегии комбинирования
+        if self.strategy == "union":
+            all_features = set()
+            for features in self.feature_sets_.values():
+                all_features.update(features)
+            self.selected_features_ = list(all_features)
+            
+        elif self.strategy == "intersection":
+            if len(self.feature_sets_) == 1:
+                self.selected_features_ = self.feature_sets_[list(self.feature_sets_.keys())[0]]
+            else:
+                common_features = set(self.feature_sets_[self.methods[0]])
+                for method in self.methods[1:]:
+                    common_features = common_features.intersection(set(self.feature_sets_[method]))
+                self.selected_features_ = list(common_features)
+                
+        elif self.strategy == "staged":
+            # Этап 1: фильтрация (Pearson или Distance Corr)
+            filter_method = "pearson" if "pearson" in self.methods else self.methods[0]
+            filtered_features = self.feature_sets_[filter_method]
+            
+            # Этап 2: модельный отбор (F-regression или Mutual Info)
+            model_methods = [m for m in self.methods if m in ["f_regression", "mutual_info"]]
+            if model_methods:
+                model_method = model_methods[0]
+                model_features = self.feature_sets_[model_method]
+                # Пересечение фильтрации и модельного отбора
+                staged_features = list(set(filtered_features) & set(model_features))
+            else:
+                staged_features = filtered_features
+            
+            # Этап 3: SHAP-отбор (если указано)
+            if self.model is not None and len(staged_features) > 1:
+                shap_selector = SHAPFeatureSelector(
+                    model=self.model,
+                    n_features=min(self.top_k, len(staged_features)),
+                    random_state=self.random_state
+                )
+                try:
+                    X_staged = X[staged_features]
+                    shap_selector.fit(X_staged, y)
+                    self.selected_features_ = shap_selector.selected_features_
+                    self.feature_importances_["shap"] = shap_selector.feature_importances_.tolist()
+                except Exception as e:
+                    if hasattr(self, "logger"):
+                        self.logger.warning(f"SHAP stage failed: {e}. Using staged features without SHAP.")
+                    self.selected_features_ = staged_features
+            else:
+                self.selected_features_ = staged_features
+        
+        # Защита от пустого результата
+        if len(self.selected_features_) == 0:
+            # Берем топ-признаки из первого метода
+            self.selected_features_ = self.feature_sets_[self.methods[0]][:min(5, len(self.feature_sets_[self.methods[0]]))]
+        
+        self.is_fitted_ = True
+        return self
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Применение отбора признаков к данным.
+        
+        Параметры
+        ----------
+        X : pd.DataFrame
+            DataFrame с признаками.
+        
+        Возвращает
+        ----------
+        X_transformed : pd.DataFrame
+            DataFrame только с отобранными признаками.
+        """
+        if not self.is_fitted_:
+            raise TimeSeriesError("Selector is not fitted. Call fit() first.")
+        
+        missing_features = set(self.selected_features_) - set(X.columns)
+        if missing_features:
+            raise TimeSeriesError(
+                f"Input DataFrame is missing features selected during fit: {missing_features}"
+            )
+        
+        return X[self.selected_features_]
+    
+    def get_selected_features(self) -> List[str]:
+        """
+        Получение списка отобранных признаков.
+        
+        Возвращает
+        ----------
+        selected_features : List[str]
+            Список имен отобранных признаков.
+        """
+        if not self.is_fitted_:
+            raise TimeSeriesError("Selector is not fitted. Call fit() first.")
+        
+        return self.selected_features_
+    
+    def get_selection_report(self) -> Dict[str, Any]:
+        """
+        Получение отчета о результатах гибридного отбора.
+        
+        Возвращает
+        ----------
+        report : Dict[str, Any]
+            Словарь с результатами по каждому методу и стратегии.
+        """
+        if not self.is_fitted_:
+            raise TimeSeriesError("Selector is not fitted. Call fit() first.")
+        
+        return {
+            "strategy": self.strategy,
+            "methods": self.methods,
+            "feature_sets": self.feature_sets_,
+            "selected_features": self.selected_features_,
+            "n_selected": len(self.selected_features_)
+        }
+
+
 class CombinedFeatureSelector(FeatureSelector):
     """
     Комбинированный селектор признаков, применяющий несколько методов последовательно.
@@ -694,7 +954,7 @@ class CombinedFeatureSelector(FeatureSelector):
     Реализует многоступенчатый подход:
     1. Фильтрация по пропускам (MissingValueSelector)
     2. Фильтрация по дисперсии (VarianceThresholdSelector)
-    3. Отбор по важности (SHAPFeatureSelector)
+    3. Отбор по важности (SHAPFeatureSelector или HybridFeatureSelector)
     
     Позволяет гибко настраивать последовательность и параметры каждого этапа.
     
@@ -704,23 +964,27 @@ class CombinedFeatureSelector(FeatureSelector):
         Порог доли пропусков для первого этапа фильтрации.
     variance_threshold : float, по умолчанию 0.0
         Порог дисперсии для второго этапа фильтрации.
+    selection_method : str, по умолчанию "shap"
+        Метод отбора на третьем этапе:
+        - "shap": SHAP-отбор
+        - "hybrid": гибридный отбор
     shap_n_features : int или float, опционально
-        Количество или доля признаков для отбора на третьем этапе.
-    shap_threshold : float, по умолчанию 'median'
-        Порог важности для SHAP-отбора.
-    shap_model : object, опционально
-        Модель для SHAP-анализа (по умолчанию Ridge).
-    shap_explainer_type : str, по умолчанию 'auto'
-        Тип SHAP-эксплейнера.
-    skip_shap : bool, по умолчанию False
-        Пропустить этап SHAP-отбора (только фильтрация).
+        Количество или доля признаков для SHAP-отбора.
+    hybrid_methods : List[str], опционально
+        Методы для гибридного отбора.
+    hybrid_strategy : str, по умолчанию "union"
+        Стратегия гибридного отбора.
+    model : object, опционально
+        Модель для SHAP или гибридного отбора.
+    skip_selection : bool, по умолчанию False
+        Пропустить этап отбора по важности.
     
     Атрибуты
     ----------
     selected_features_ : List[str]
         Список окончательно отобранных признаков.
     feature_importances_ : np.ndarray или None
-        Важность признаков после SHAP-анализа (если применялся).
+        Важность признаков после отбора.
     selectors_ : List[FeatureSelector]
         Список примененных селекторов в порядке выполнения.
     is_fitted_ : bool
@@ -745,7 +1009,10 @@ class CombinedFeatureSelector(FeatureSelector):
     >>> selector = CombinedFeatureSelector(
     ...     missing_threshold=0.15,   # Удаляем 'noisy' (20% > 15%)
     ...     variance_threshold=0.01,  # Удаляем 'constant'
-    ...     shap_n_features=2         # Оставляем только 2 самых важных
+    ...     selection_method="hybrid",
+    ...     hybrid_methods=["pearson", "distance_corr"],
+    ...     hybrid_strategy="union",
+    ...     hybrid_top_k=2
     ... )
     >>> X_selected = selector.fit_transform(X, y)
     >>> 
@@ -757,20 +1024,24 @@ class CombinedFeatureSelector(FeatureSelector):
         self,
         missing_threshold: float = 0.2,
         variance_threshold: float = 0.0,
+        selection_method: str = "shap",
         shap_n_features: Optional[Union[int, float]] = None,
-        shap_threshold: Union[str, float] = "median",
-        shap_model: Optional[object] = None,
-        shap_explainer_type: str = "auto",
-        skip_shap: bool = False,
+        hybrid_methods: Optional[List[str]] = None,
+        hybrid_strategy: str = "union",
+        hybrid_top_k: int = 20,
+        model: Optional[object] = None,
+        skip_selection: bool = False,
     ):
         super().__init__()
         self.missing_threshold = missing_threshold
         self.variance_threshold = variance_threshold
+        self.selection_method = selection_method
         self.shap_n_features = shap_n_features
-        self.shap_threshold = shap_threshold
-        self.shap_model = shap_model
-        self.shap_explainer_type = shap_explainer_type
-        self.skip_shap = skip_shap
+        self.hybrid_methods = hybrid_methods or ["pearson", "distance_corr"]
+        self.hybrid_strategy = hybrid_strategy
+        self.hybrid_top_k = hybrid_top_k
+        self.model = model
+        self.skip_selection = skip_selection
     
     def fit(self, X: pd.DataFrame, y: Union[pd.Series, np.ndarray]) -> "CombinedFeatureSelector":
         """
@@ -801,22 +1072,32 @@ class CombinedFeatureSelector(FeatureSelector):
         )
         X_stage2 = variance_selector.fit_transform(X_stage1, y)
         
-        # Этап 3: SHAP-отбор (опционально)
-        if not self.skip_shap and X_stage2.shape[1] > 1:
-            shap_selector = SHAPFeatureSelector(
-                model=self.shap_model,
-                n_features=self.shap_n_features,
-                threshold=self.shap_threshold,
-                explainer_type=self.shap_explainer_type,
-                max_samples=min(1000, len(X_stage2)),
-                random_state=42
-            )
+        # Этап 3: Отбор по важности (SHAP или Hybrid)
+        if not self.skip_selection and X_stage2.shape[1] > 1:
+            if self.selection_method == "shap":
+                final_selector = SHAPFeatureSelector(
+                    model=self.model,
+                    n_features=self.shap_n_features,
+                    max_samples=min(1000, len(X_stage2)),
+                    random_state=42
+                )
+            elif self.selection_method == "hybrid":
+                final_selector = HybridFeatureSelector(
+                    methods=self.hybrid_methods,
+                    strategy=self.hybrid_strategy,
+                    top_k=self.hybrid_top_k,
+                    model=self.model,
+                    random_state=42
+                )
+            else:
+                raise ValueError(f"Unknown selection_method: {self.selection_method}")
+            
             try:
-                X_stage3 = shap_selector.fit_transform(X_stage2, y)
-                self.feature_importances_ = shap_selector.feature_importances_
+                X_stage3 = final_selector.fit_transform(X_stage2, y)
+                self.feature_importances_ = final_selector.feature_importances_
             except Exception as e:
                 if hasattr(self, "logger"):
-                    self.logger.warning(f"SHAP selection failed: {e}. Skipping SHAP stage.")
+                    self.logger.warning(f"Final selection failed: {e}. Skipping final stage.")
                 X_stage3 = X_stage2
                 self.feature_importances_ = None
         else:
@@ -826,8 +1107,8 @@ class CombinedFeatureSelector(FeatureSelector):
         # Сохранение результатов
         self.selected_features_ = X_stage3.columns.tolist()
         self.selectors_ = [missing_selector, variance_selector]
-        if not self.skip_shap and X_stage2.shape[1] > 1:
-            self.selectors_.append(shap_selector)
+        if not self.skip_selection and X_stage2.shape[1] > 1:
+            self.selectors_.append(final_selector)
         
         # Защита от полного удаления признаков
         if len(self.selected_features_) == 0:

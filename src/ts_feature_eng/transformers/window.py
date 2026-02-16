@@ -1,63 +1,62 @@
 # src/ts_feature_eng/transformers/window.py
-"""
-Трансформеры на основе скользящего окна для временных рядов.
 
-Реализует преобразования на основе статистик, вычисленных в скользящих окнах.
-Поддерживает различные типы преобразований (identity, diff, sma) и статистик
-(среднее, стандартное отвление, минимум, максимум, асимметрия, эксцесс, наклон, автокорреляция).
+"""
+Модуль для оконных преобразований временных рядов.
+
+Предоставляет WindowTransformer — универсальный трансформер для генерации
+оконных статистик, разностных преобразований и лагов на основе скользящих окон.
 """
 
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LinearRegression
 
-from ..base import TimeSeriesError, TimeSeriesTransformer
+from ..base import TimeSeriesTransformer
 
 
 class WindowTransformer(TimeSeriesTransformer):
     """
-    Трансформер временных рядов на основе скользящего окна.
+    Трансформер для генерации оконных признаков временного ряда.
     
-    Генерирует признаки путем применения статистик к скользящим окнам
-    различных преобразований исходного ряда.
+    Поддерживает различные типы преобразований (identity, diff, pct_change)
+    и статистик (mean, std, min, max, slope, acf1, lag_N).
     
     Параметры
     ----------
-    window_size : int, по умолчанию 24
+    window_size : int
         Размер скользящего окна в наблюдениях.
-    transformations : List[str], по умолчанию ["identity", "diff"]
-        Список преобразований для применения:
+    transformations : List[str], по умолчанию ["identity"]
+        Список преобразований для применения к исходному ряду:
         - "identity": исходный ряд
-        - "diff": первая разность (Δxₜ = xₜ - xₜ₋₁)
-        - "sma": простая скользящая средняя (сглаживание)
-    statistics : List[str], по умолчанию все доступные
+        - "diff": первая разность
+        - "pct_change": процентное изменение
+        - "sma": простое скользящее среднее
+    statistics : List[str], по умолчанию ["mean", "std"]
         Список статистик для вычисления над окном:
         - "mean": среднее значение
         - "std": стандартное отклонение
-        - "min": минимум
-        - "max": максимум
-        - "skewness": коэффициент асимметрии
-        - "kurtosis": коэффициент эксцесса
-        - "slope": наклон линейной регрессии по окну
-        - "acf1": автокорреляция первого лага
-        - "last": последнее значение в окне
-    center : bool, по умолчанию False
-        Если True, окно центрировано относительно текущей точки (симметричное окно).
-        Если False, окно включает текущую точку и `window_size-1` предыдущих точек.
+        - "min": минимальное значение
+        - "max": максимальное значение
+        - "slope": наклон линейной регрессии
+        - "acf1": автокорреляция первого порядка
+        - "skewness": асимметрия
+        - "kurtosis": эксцесс
+        - "lag_N": лаг на N шагов (например, "lag_1", "lag_24")
     min_periods : int, по умолчанию 1
         Минимальное количество наблюдений в окне для вычисления статистики.
-        Если наблюдений меньше — результат будет NaN.
     
     Атрибуты
     ----------
+    window_size_ : int
+        Валидированный размер окна после обучения.
+    transformations_ : List[str]
+        Валидированные преобразования после обучения.
+    statistics_ : List[str]
+        Валидированные статистики после обучения.
     feature_names_ : List[str]
-        Имена сгенерированных признаков в формате:
-        "{исходный_столбец}.{преобразование}.{статистика}"
-    is_fitted_ : bool
-        Флаг, указывающий, был ли вызван метод fit().
+        Имена сгенерированных признаков.
     
     Примеры
     --------
@@ -67,125 +66,140 @@ class WindowTransformer(TimeSeriesTransformer):
     >>> 
     >>> # Создаем тестовый временной ряд
     >>> dates = pd.date_range("2023-01-01", periods=100, freq="H")
-    >>> df = pd.DataFrame({"value": np.random.randn(100)}, index=dates)
+    >>> df = pd.DataFrame({"value": np.sin(np.arange(100) / 10) + np.random.randn(100) * 0.1}, index=dates)
     >>> 
     >>> # Создаем и применяем трансформер
-    >>> transformer = WindowTransformer(
+    >>> window_transformer = WindowTransformer(
     ...     window_size=24,
     ...     transformations=["identity", "diff"],
-    ...     statistics=["mean", "std", "slope"]
+    ...     statistics=["mean", "std", "slope", "lag_1", "lag_24"]
     ... )
-    >>> X_transformed = transformer.fit_transform(df)
+    >>> df_windowed = window_transformer.fit_transform(df)
     >>> 
-    >>> print(X_transformed.columns.tolist())
-    ['value.identity.mean', 'value.identity.std', 'value.identity.slope',
-     'value.diff.mean', 'value.diff.std', 'value.diff.slope']
+    >>> print(f"Сгенерировано признаков: {df_windowed.shape[1]}")
+    >>> print(f"Примеры признаков: {list(df_windowed.columns[:5])}")
     """
-    
-    _valid_transformations = ["identity", "diff", "sma"]
-    _valid_statistics = ["mean", "std", "min", "max", "skewness", "kurtosis", "slope", "acf1", "last"]
     
     def __init__(
         self,
-        window_size: int = 24,
-        transformations: Optional[List[str]] = None,
-        statistics: Optional[List[str]] = None,
-        center: bool = False,
-        min_periods: int = 1,
+        window_size: int,
+        transformations: List[str] = None,
+        statistics: List[str] = None,
+        min_periods: int = 1
     ):
-        super().__init__()
-        
-        # ИСПРАВЛЕНИЕ: Конвертируем numpy.int64 и другие числовые типы в int
-        if isinstance(window_size, (int, np.integer)):
-            window_size = int(window_size)
-        elif isinstance(window_size, float):
-            if window_size.is_integer():
-                window_size = int(window_size)
-            else:
-                raise ValueError(f"window_size must represent an integer, got {window_size}")
-        else:
-            raise ValueError(f"window_size must be an integer, got {type(window_size)}")
-        
-        if isinstance(min_periods, (int, np.integer)):
-            min_periods = int(min_periods)
-        elif isinstance(min_periods, float):
-            if min_periods.is_integer():
-                min_periods = int(min_periods)
-            else:
-                raise ValueError(f"min_periods must represent an integer, got {min_periods}")
-        else:
-            raise ValueError(f"min_periods must be an integer, got {type(min_periods)}")
+        if window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
         
         self.window_size = window_size
-        self.transformations = transformations or ["identity", "diff"]
-        self.statistics = statistics or self._valid_statistics.copy()
-        self.center = center
+        self.transformations = transformations or ["identity"]
+        self.statistics = statistics or ["mean", "std"]
         self.min_periods = min_periods
         
-        # Валидация параметров при инициализации
-        self._validate_params()
-
-    def _validate_params(self) -> None:
-        """Валидация гиперпараметров трансформера."""
-        # Проверка window_size
-        if not isinstance(self.window_size, int) or self.window_size <= 0:
-            raise ValueError(f"window_size must be positive integer, got {self.window_size}")
-        
-        # Проверка min_periods
-        if not isinstance(self.min_periods, int) or self.min_periods <= 0:
-            raise ValueError(f"min_periods must be positive integer, got {self.min_periods}")
-        
-        if self.min_periods > self.window_size:
-            raise ValueError(
-                f"min_periods ({self.min_periods}) cannot be greater than window_size ({self.window_size})"
-            )
-        
-        invalid_transforms = set(self.transformations) - set(self._valid_transformations)
+        # Валидация параметров
+        valid_transformations = {"identity", "diff", "pct_change", "sma"}
+        invalid_transforms = set(self.transformations) - valid_transformations
         if invalid_transforms:
-            raise ValueError(
-                f"Invalid transformations: {invalid_transforms}. "
-                f"Valid options: {self._valid_transformations}"
-            )
+            raise ValueError(f"Invalid transformations: {invalid_transforms}. Valid options: {valid_transformations}")
         
-        invalid_stats = set(self.statistics) - set(self._valid_statistics)
+        # Извлекаем лаги из статистик
+        self.lag_statistics = []
+        self.base_statistics = []
+        
+        for stat in self.statistics:
+            if stat.startswith("lag_"):
+                try:
+                    lag_value = int(stat.split("_")[1])
+                    if lag_value <= 0:
+                        raise ValueError(f"lag value must be positive: {stat}")
+                    self.lag_statistics.append(lag_value)
+                except (ValueError, IndexError):
+                    raise ValueError(f"Invalid lag statistic format: {stat}. Use 'lag_N' where N is positive integer.")
+            else:
+                self.base_statistics.append(stat)
+        
+        valid_statistics = {
+            "mean", "std", "min", "max", "slope", "acf1", 
+            "skewness", "kurtosis"
+        }
+        invalid_stats = set(self.base_statistics) - valid_statistics
         if invalid_stats:
-            raise ValueError(
-                f"Invalid statistics: {invalid_stats}. "
-                f"Valid options: {self._valid_statistics}"
-            )
-
-    def fit(self, X: Union[pd.DataFrame, np.ndarray], y=None) -> "WindowTransformer":
+            raise ValueError(f"Invalid statistics: {invalid_stats}. Valid options: {valid_statistics}")
+    
+    def fit(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Optional[Union[pd.Series, np.ndarray]] = None
+    ) -> "WindowTransformer":
         """
-        Обучение трансформера (в данном случае — только валидация данных).
+        Обучение трансформера оконных признаков.
         
         Параметры
         ----------
         X : pd.DataFrame или np.ndarray
             Входные данные временного ряда.
-        y : любое, опционально
-            Целевая переменная (игнорируется, так как трансформер не использует целевую переменную).
+        y : pd.Series, np.ndarray или None, опционально
+            Целевая переменная (игнорируется).
         
         Возвращает
         ----------
         self : WindowTransformer
             Обученный трансформер.
         """
-        X = self._validate_input(X)
+        # Валидация входных данных
+        X_validated = self._validate_data(X)
         
-        # Проверка на константные столбцы (могут вызвать проблемы со статистиками)
-        constant_cols = X.columns[X.nunique() <= 1]
-        if len(constant_cols) > 0:
-            raise TimeSeriesError(
-                f"Input contains constant columns: {list(constant_cols)}. "
-                "Window statistics cannot be computed for constant series."
+        # Проверка, что размер окна меньше длины ряда
+        if self.window_size >= len(X_validated):
+            raise ValueError(
+                f"window_size ({self.window_size}) must be less than the number of observations ({len(X_validated)})"
             )
         
-        self.is_fitted_ = True
+        # Сохраняем параметры
+        self.window_size_ = self.window_size
+        self.transformations_ = self.transformations.copy()
+        self.statistics_ = self.statistics.copy()
+        self.n_features_in_ = X_validated.shape[1]
+        self.feature_names_in_ = (
+            X_validated.columns.tolist() 
+            if isinstance(X_validated, pd.DataFrame) 
+            else [f"feature_{i}" for i in range(X_validated.shape[1])]
+        )
+        
+        # Генерируем имена выходных признаков
+        self.feature_names_ = []
+        for feature_name in self.feature_names_in_:
+            for transform in self.transformations_:
+                for stat in self.base_statistics:
+                    self.feature_names_.append(f"{feature_name}.{transform}.{stat}")
+            
+            # Добавляем лаги (они не зависят от преобразования)
+            for lag in self.lag_statistics:
+                self.feature_names_.append(f"{feature_name}.lag_{lag}")
+        
         return self
+    
+    def get_feature_names_out(self, input_features: Optional[List[str]] = None) -> List[str]:
+        """
+        Получение имен выходных признаков.
+        
+        Параметры
+        ----------
+        input_features : List[str], опционально
+            Имена входных признаков (игнорируются, используются сохраненные имена).
+        
+        Возвращает
+        ----------
+        feature_names : List[str]
+            Список имен сгенерированных признаков.
+        """
+        if not hasattr(self, 'feature_names_'):
+            raise ValueError("WindowTransformer has not been fitted. Call fit() first.")
+        
+        return self.feature_names_.copy()
 
     def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
         """
-        Применение трансформации к данным и генерация признаков.
+        Применение трансформера оконных признаков к данным.
         
         Параметры
         ----------
@@ -195,259 +209,187 @@ class WindowTransformer(TimeSeriesTransformer):
         Возвращает
         ----------
         X_transformed : pd.DataFrame
-            DataFrame с сгенерированными признаками. Индекс сохраняется от исходных данных.
+            DataFrame с сгенерированными оконными признаками.
+        
+        Выбрасывает
+        ----------
+        ValueError
+            Если метод вызван до обучения (fit).
         """
-        if not self.is_fitted_:
-            raise TimeSeriesError("Transformer is not fitted. Call fit() first.")
+        if not hasattr(self, 'window_size_'):
+            raise ValueError("WindowTransformer has not been fitted. Call fit() before transform().")
         
-        X = self._validate_input(X)
+        # Валидация входных данных
+        X_validated = self._validate_data(X)
         
-        # Словарь для накопления сгенерированных признаков
-        features = {}
-        feature_names = []
+        # Проверка соответствия количества признаков
+        if X_validated.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"Expected {self.n_features_in_} features, but got {X_validated.shape[1]}"
+            )
         
-        # Обработка каждого столбца исходного DataFrame
-        for col in X.columns:
-            series = X[col]
+        # Создаем словарь для результатов
+        transformed_features = {}
+        
+        # Обрабатываем каждый признак
+        for i, feature_name in enumerate(self.feature_names_in_):
+            feature_series = (
+                X_validated.iloc[:, i] 
+                if isinstance(X_validated, pd.DataFrame) 
+                else X_validated[:, i]
+            )
             
-            # Применение каждого преобразования
-            for trans in self.transformations:
-                transformed = self._apply_transformation(series, trans)
+            # Применяем преобразования
+            transformed_series = {}
+            for transform in self.transformations_:
+                if transform == "identity":
+                    transformed_series[transform] = feature_series
+                elif transform == "diff":
+                    transformed_series[transform] = feature_series.diff()
+                elif transform == "pct_change":
+                    transformed_series[transform] = feature_series.pct_change()
+                elif transform == "sma":
+                    transformed_series[transform] = feature_series.rolling(
+                        window=self.window_size_, 
+                        min_periods=self.min_periods
+                    ).mean()
+            
+            # Вычисляем статистики для каждого преобразования
+            for transform, series in transformed_series.items():
+                windowed = series.rolling(window=self.window_size_, min_periods=self.min_periods)
                 
-                # Вычисление каждой статистики над преобразованным рядом
-                for stat in self.statistics:
-                    feature_name = f"{col}.{trans}.{stat}"
-                    feature_values = self._compute_statistic(transformed, stat)
-                    features[feature_name] = feature_values
-                    feature_names.append(feature_name)
+                for stat in self.base_statistics:
+                    feature_key = f"{feature_name}.{transform}.{stat}"
+                    
+                    if stat == "mean":
+                        transformed_features[feature_key] = windowed.mean()
+                    elif stat == "std":
+                        transformed_features[feature_key] = windowed.std()
+                    elif stat == "min":
+                        transformed_features[feature_key] = windowed.min()
+                    elif stat == "max":
+                        transformed_features[feature_key] = windowed.max()
+                    elif stat == "slope":
+                        transformed_features[feature_key] = self._compute_slope(series, self.window_size_)
+                    elif stat == "acf1":
+                        transformed_features[feature_key] = self._compute_acf1(series, self.window_size_)
+                    elif stat == "skewness":
+                        transformed_features[feature_key] = windowed.apply(
+                            lambda x: stats.skew(x, nan_policy='omit'), raw=False
+                        )
+                    elif stat == "kurtosis":
+                        transformed_features[feature_key] = windowed.apply(
+                            lambda x: stats.kurtosis(x, nan_policy='omit'), raw=False
+                        )
+            
+            # Добавляем лаги
+            for lag in self.lag_statistics:
+                lag_key = f"{feature_name}.lag_{lag}"
+                transformed_features[lag_key] = feature_series.shift(lag)
         
-        # Формирование результата
-        X_transformed = pd.DataFrame(features, index=X.index)
-        self.feature_names_ = feature_names
+        # Создаем итоговый DataFrame
+        X_transformed = pd.DataFrame(transformed_features, index=X_validated.index)
         
         return X_transformed
-
-    def _apply_transformation(self, series: pd.Series, transformation: str) -> pd.Series:
+    
+    def fit_transform(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Optional[Union[pd.Series, np.ndarray]] = None
+    ) -> pd.DataFrame:
         """
-        Применение преобразования к временному ряду.
+        Обучение и применение трансформера за один шаг.
         
         Параметры
         ----------
-        series : pd.Series
-            Исходный временной ряд.
-        transformation : str
-            Тип преобразования ("identity", "diff", "sma").
+        X : pd.DataFrame или np.ndarray
+            Входные данные временного ряда.
+        y : pd.Series, np.ndarray или None, опционально
+            Целевая переменная (игнорируется).
         
         Возвращает
         ----------
-        transformed : pd.Series
-            Преобразованный временной ряд.
+        X_transformed : pd.DataFrame
+            DataFrame с сгенерированными оконными признаками.
         """
-        if transformation == "identity":
-            return series
-        
-        elif transformation == "diff":
-            return series.diff()
-        
-        elif transformation == "sma":
-            # Простая скользящая средняя с тем же размером окна
-            return series.rolling(window=self.window_size, center=self.center, min_periods=1).mean()
-        
-        else:
-            raise ValueError(f"Unknown transformation: {transformation}")
-
-    def _compute_statistic(self, series: pd.Series, statistic: str) -> pd.Series:
+        return self.fit(X, y).transform(X)
+    
+    def get_feature_names_out(self, input_features: Optional[List[str]] = None) -> List[str]:
         """
-        Вычисление статистики над скользящем окне.
+        Получение имен выходных признаков.
         
         Параметры
         ----------
-        series : pd.Series
-            Временной ряд (возможно, уже преобразованный).
-        statistic : str
-            Тип статистики для вычисления.
-        
-        Возвращает
-        ----------
-        result : pd.Series
-            Результат вычисления статистики для каждого окна.
-        """
-        # Создаем объект скользящего окна
-        rolling = series.rolling(
-            window=self.window_size,
-            center=self.center,
-            min_periods=self.min_periods
-        )
-        
-        if statistic == "mean":
-            return rolling.mean()
-        
-        elif statistic == "std":
-            return rolling.std(ddof=1)  # ddof=1 для несмещенной оценки
-        
-        elif statistic == "min":
-            return rolling.min()
-        
-        elif statistic == "max":
-            return rolling.max()
-        
-        elif statistic == "skewness":
-            # Используем метод скользящего окна для асимметрии
-            return rolling.apply(lambda x: stats.skew(x, nan_policy="omit"), raw=True)
-        
-        elif statistic == "kurtosis":
-            # Используем метод скользящего окна для эксцесса
-            return rolling.apply(lambda x: stats.kurtosis(x, nan_policy="omit"), raw=True)
-        
-        elif statistic == "slope":
-            # Наклон линейной регрессии по окну
-            return rolling.apply(self._compute_slope, raw=True)
-        
-        elif statistic == "acf1":
-            # Автокорреляция первого лага
-            return rolling.apply(self._compute_acf1, raw=True)
-        
-        elif statistic == "last":
-            # Последнее значение в окне (эквивалентно сдвигу)
-            return series.shift(1) if not self.center else series
-        
-        else:
-            raise ValueError(f"Unknown statistic: {statistic}")
-
-    @staticmethod
-    def _compute_slope(window: np.ndarray) -> float:
-        """
-        Вычисление наклона линейной регрессии по окну.
-        
-        Параметры
-        ----------
-        window : np.ndarray
-            Массив значений в окне.
-        
-        Возвращает
-        ----------
-        slope : float
-            Наклон линии регрессии (коэффициент при x).
-        """
-        # Удаляем NaN значения
-        valid = ~np.isnan(window)
-        if valid.sum() < 2:  # Нужно минимум 2 точки для регрессии
-            return np.nan
-        
-        x = np.arange(len(window))[valid]
-        y = window[valid]
-        
-        # Простая линейная регрессия через МНК
-        if len(x) < 2:
-            return np.nan
-        
-        # Вычисление наклона: cov(x,y)/var(x)
-        x_centered = x - x.mean()
-        y_centered = y - y.mean()
-        numerator = np.sum(x_centered * y_centered)
-        denominator = np.sum(x_centered ** 2)
-        
-        if denominator == 0:
-            return np.nan
-        
-        return numerator / denominator
-
-    @staticmethod
-    def _compute_acf1(window: np.ndarray) -> float:
-        """
-        Вычисление автокорреляции первого лага по окну.
-        
-        Параметры
-        ----------
-        window : np.ndarray
-            Массив значений в окне.
-        
-        Возвращает
-        ----------
-        acf1 : float
-            Автокорреляция первого лага.
-        """
-        # Удаляем NaN значения
-        valid = ~np.isnan(window)
-        if valid.sum() < 3:  # Нужно минимум 3 точки для автокорреляции
-            return np.nan
-        
-        series = window[valid]
-        n = len(series)
-        
-        if n < 2:
-            return np.nan
-        
-        # Центрируем ряд
-        series_centered = series - series.mean()
-        
-        # Автоковариация лага 1
-        autocov_1 = np.sum(series_centered[1:] * series_centered[:-1]) / n
-        
-        # Дисперсия
-        variance = np.sum(series_centered ** 2) / n
-        
-        if variance == 0:
-            return np.nan
-        
-        return autocov_1 / variance
-
-    def get_feature_names(self) -> List[str]:
-        """
-        Получение имен сгенерированных признаков.
+        input_features : List[str], опционально
+            Имена входных признаков (игнорируются, используются сохраненные имена).
         
         Возвращает
         ----------
         feature_names : List[str]
-            Список имен признаков в формате "{столбец}.{преобразование}.{статистика}".
+            Список имен сгенерированных признаков.
         """
-        if not self.is_fitted_:
-            raise TimeSeriesError("Transformer is not fitted. Call fit() first.")
+        if not hasattr(self, 'feature_names_'):
+            raise ValueError("WindowTransformer has not been fitted. Call fit() first.")
         
-        return self.feature_names_
+        return self.feature_names_.copy()
     
-    def get_params(self, deep: bool = True) -> Dict[str, Union[int, List[str], bool]]:
+    def _compute_slope(self, series: pd.Series, window_size: int) -> pd.Series:
+        """Вычисление наклона линейной регрессии в скользящем окне."""
+        def slope_func(window):
+            if len(window.dropna()) < 2:
+                return np.nan
+            x = np.arange(len(window))
+            y = window.values
+            mask = ~np.isnan(y)
+            if sum(mask) < 2:
+                return np.nan
+            slope, _ = np.polyfit(x[mask], y[mask], 1)
+            return slope
+        
+        return series.rolling(window=window_size, min_periods=self.min_periods).apply(
+            slope_func, raw=False
+        )
+    
+    def _compute_acf1(self, series: pd.Series, window_size: int) -> pd.Series:
+        """Вычисление автокорреляции первого порядка в скользящем окне."""
+        def acf1_func(window):
+            if len(window.dropna()) < 2:
+                return np.nan
+            return np.corrcoef(window[:-1], window[1:])[0, 1] if len(window) > 1 else np.nan
+        
+        return series.rolling(window=window_size, min_periods=self.min_periods).apply(
+            acf1_func, raw=False
+        )
+    
+    def _validate_data(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
         """
-        Получение параметров трансформера (совместимость с sklearn).
+        Валидация и нормализация входных данных.
         
         Параметры
         ----------
-        deep : bool, по умолчанию True
-            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        X : pd.DataFrame или np.ndarray
+            Входные данные.
         
         Возвращает
         ----------
-        params : Dict[str, Any]
-            Словарь параметров трансформера.
+        X_validated : pd.DataFrame
+            Валидированный DataFrame.
         """
-        return {
-            "window_size": self.window_size,
-            "transformations": self.transformations,
-            "statistics": self.statistics,
-            "center": self.center,
-            "min_periods": self.min_periods,
-        }
-
-    def set_params(self, **params) -> "WindowTransformer":
-        """
-        Установка параметров трансформера (совместимость с sklearn).
+        if isinstance(X, np.ndarray):
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            X = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
         
-        Параметры
-        ----------
-        **params : Dict[str, Any]
-            Параметры для установки.
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError(f"X must be pd.DataFrame or np.ndarray, got {type(X)}")
         
-        Возвращает
-        ----------
-        self : WindowTransformer
-            Трансформер с обновленными параметрами.
-        """
-        for key, value in params.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            else:
-                raise ValueError(f"Invalid parameter {key} for WindowTransformer")
+        if X.empty:
+            raise ValueError("Input DataFrame is empty")
         
-        # Повторная валидация после изменения параметров
-        self._validate_params()
-        return self
+        # Проверка на наличие временного индекса или RangeIndex
+        valid_index_types = (pd.DatetimeIndex, pd.RangeIndex, pd.Index)
+        if not isinstance(X.index, valid_index_types):
+            # Попытка конвертации в RangeIndex
+            X = X.reset_index(drop=True)
+        
+        return X

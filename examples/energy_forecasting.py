@@ -14,6 +14,7 @@
 4. Автоматический подбор оптимальных методов инженерии признаков
 5. Прогнозирование на разные горизонты (1 час, 24 часа)
 6. Сравнение с базовыми моделями и интерпретация результатов
+7. Гибридная инженерия признаков (обязательные лаги + адаптивные преобразования)
 """
 
 import os
@@ -27,6 +28,7 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from ts_feature_eng import AutoFeatureEngineer
 from ts_feature_eng.transformers.time_encoding import CalendarFeaturesTransformer
+from ts_feature_eng.transformers.lag import LagTransformer
 
 
 def load_morocco_energy_data(data_path=None):
@@ -451,9 +453,9 @@ def main():
     print(f"   Обучающая выборка: {len(X_train)} наблюдений ({X_train.index.min()} — {X_train.index.max()})")
     print(f"   Тестовая выборка: {len(X_test)} наблюдений ({X_test.index.min()} — {X_test.index.max()})")
     
-    # Шаг 6: Автоматическая инженерия признаков
-    print("\n6. Автоматическая инженерия признаков с адаптацией к сезонным паттернам...")
-    print("   Режим: байесовская оптимизация (20 итераций) + фильтрация признаков")
+    # Шаг 6: Автоматическая инженерия признаков с гибридным подходом
+    print("\n6. Автоматическая инженерия признаков с гибридным подходом...")
+    print("   Режим: core pipeline (обязательные лаги) + auto pipeline (адаптивные преобразования)")
     
     engineer = AutoFeatureEngineer(
         optimize=True,
@@ -462,7 +464,7 @@ def main():
         apply_selection=True,
         selection_threshold=0.25,
         variance_threshold=0.01,
-        shap_selection=False,  # Отключаем для ускорения
+        shap_selection=False,  
         random_state=42,
         verbose=1
     )
@@ -475,7 +477,8 @@ def main():
     
     # Группируем признаки по типу для лучшей интерпретации
     feature_groups = {
-        "Оконные (тренд/волатильность)": [col for col in X_train_transformed.columns if "window" in col][:3],
+        "Core (лаги)": [col for col in X_train_transformed.columns if "lag_" in col][:3],
+        "Оконные (тренд/волатильность)": [col for col in X_train_transformed.columns if "window" in col and "lag_" not in col][:3],
         "Спектральные (сезонность)": [col for col in X_train_transformed.columns if "stl" in col or "dwt" in col][:3],
         "Временные (цикличность)": [col for col in X_train_transformed.columns if "time." in col][:3],
         "Календарные (Рамадан/будни)": [col for col in X_train_transformed.columns if "calendar" in col or "ramadan" in col.lower()][:3]
@@ -535,6 +538,7 @@ def main():
     # Анализ по группам признаков
     print("\n   Важность по группам признаков:")
     groups = {
+        "Core (лаги)": ["lag_"],
         "Оконные преобразования": ["window"],
         "Спектральные методы": ["stl", "dwt"],
         "Временное кодирование": ["time."],
