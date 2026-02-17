@@ -47,8 +47,8 @@ __pypackages__/
 logs/
 *.log
 
-# Data
-data/
-*.csv
-*.parquet
-*.h5
+# # Data
+# data/
+# *.csv
+# *.parquet
+# *.h5
