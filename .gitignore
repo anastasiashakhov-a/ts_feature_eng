@@ -46,8 +46,11 @@ __pypackages__/
 # Logs
 logs/
 *.log
+test_report.txt
 
 # # Data
+/results
+/*.png
 # data/
 # *.csv
 # *.parquet
