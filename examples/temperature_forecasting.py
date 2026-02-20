@@ -1,4 +1,4 @@
-# examples/temperature_forecasting.py 
+# examples/temperature_forecasting.py
 
 """
 Пример прогнозирования минимальных суточных температур.
@@ -14,11 +14,18 @@
 5. Прогнозирование на разные горизонты (1 день, 7 дней)
 6. Сравнение с базовыми моделями и интерпретация результатов
 7. Гибридная инженерия признаков (обязательные лаги + адаптивные преобразования)
+
+Использует улучшенный оптимизатор v2.0:
+- Out-of-sample penalties для честной оценки
+- Semantic entropy для разнообразия признаков
+- Relative score vs naive для переносимости между задачами
+- Диагностика collapse и dominance
 """
 
 import os
 import json
 import hashlib
+import warnings
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -30,7 +37,12 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
-from ts_feature_eng import AutoFeatureEngineer
+from ts_feature_eng import AutoFeatureEngineer, OptimizerConfig  # ← НОВЫЙ ИМПОРТ
+from ts_feature_eng.utils.metrics import (  # ← ИСПОЛЬЗУЕМ utils/metrics.py
+    relative_score,
+    regime_robustness,
+    naive_gain
+)
 from ts_feature_eng.transformers.time_encoding import CalendarFeaturesTransformer
 from ts_feature_eng.transformers.lag import LagTransformer
 
@@ -44,7 +56,7 @@ EXPERIMENT_CONFIG = {
     "n_initial_points": 3,        # Начальные точки оптимизации
     "selection_threshold": 0.25,  # Порог отбора признаков
     "variance_threshold": 0.01,   # Порог дисперсии
-    "shap_selection": True,      # Отключить SHAP для скорости
+    "shap_selection": True,      
     "n_estimators": 100,          # Деревья в модели
     "max_depth": 6,               # Глубина деревьев
     "learning_rate": 0.1,         # Скорость обучения
@@ -52,6 +64,39 @@ EXPERIMENT_CONFIG = {
     "train_test_split": 0.8,      # Доля обучающей выборки
     "forecast_horizons": [1, 7],  # Горизонты прогнозирования (дни)
 }
+
+# ============================================================================
+# КОНФИГУРАЦИЯ ОПТИМИЗАТОРА (INDUCTIVE BIASES)
+# ============================================================================
+OPTIMIZER_CONFIG = OptimizerConfig(
+    # Штрафы за тривиальные решения
+    dominance_lambda=0.5,          # Штраф если один признак >70% важности
+    naive_lambda=0.3,              # Штраф если прогноз ≈ lag_1
+    collapse_lambda=0.4,           # Штраф за feature collapse
+    
+    # Пороги
+    dominance_threshold=0.7,       # Макс. доля важности одного признака
+    naive_corr_threshold=0.95,     # Макс. корреляция с lag_1
+    
+    # Масштабирование и OOF
+    scale_penalties=True,          # Приводить штрафы к масштабу MAE
+    use_oof_penalties=True,        # Считать штрафы на OOF predictions
+    
+    # Разнообразие признаков
+    entropy_lambda=0.1,            # Бонус за семантическое разнообразие
+    
+    # Диагностика
+    log_diagnostics=True,          # Логировать диагностические метрики
+    diagnostics_file="results/optimization_diagnostics.csv",
+    
+    # Горизонты (для horizon-aware scoring)
+    use_horizon_aware=False,       # Включить gain(h) метрику
+    forecast_horizons=[1, 7],      # Горизонты для оценки
+    
+    # Search space
+    use_conditional_space=True,    # Активные параметры только если группа включена
+    use_progressive_modes=False,   # Запускать BO в фазах (baseline→structure→full)
+)
 
 
 def get_experiment_id(config):
@@ -91,9 +136,18 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
         "r2": metrics.get("R²", np.nan),
         "error_from_range_pct": metrics.get("Ошибка от диапазона (%)", np.nan),
         "temp_range_c": metrics.get("Диапазон температур (°C)", np.nan),
+        "relative_score": metrics.get("Relative Score vs Naive", np.nan),  # ← НОВАЯ МЕТРИКА
+        "naive_gain": metrics.get("Naive Gain", np.nan),                  # ← НОВАЯ МЕТРИКА
+        "mae_calm": metrics.get("MAE Calm", np.nan),                     # ← НОВАЯ МЕТРИКА
+        "mae_volatile": metrics.get("MAE Volatile", np.nan),             # ← НОВАЯ МЕТРИКА
+        "robustness_ratio": metrics.get("Robustness Ratio", np.nan),     # ← НОВАЯ МЕТРИКА
         "n_features": metrics.get("n_features", 0),
         "n_train_samples": metrics.get("n_train_samples", 0),
         "n_test_samples": metrics.get("n_test_samples", 0),
+        # Диагностика оптимизатора
+        "max_feature_share": metrics.get("max_feature_share", np.nan),
+        "naive_corr": metrics.get("naive_corr", np.nan),
+        "semantic_entropy": metrics.get("semantic_entropy", np.nan),
     }
     
     # Проверяем, существует ли файл
@@ -135,6 +189,13 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
         "timestamp": timestamp,
         "experiment_id": experiment_id,
         "config": config,
+        "optimizer_config": {
+            "dominance_lambda": OPTIMIZER_CONFIG.dominance_lambda,
+            "naive_lambda": OPTIMIZER_CONFIG.naive_lambda,
+            "entropy_lambda": OPTIMIZER_CONFIG.entropy_lambda,
+            "scale_penalties": OPTIMIZER_CONFIG.scale_penalties,
+            "use_oof_penalties": OPTIMIZER_CONFIG.use_oof_penalties,
+        },
         "metrics": metrics,
     }
     
@@ -327,9 +388,9 @@ def plot_temperature_patterns(df, title="Паттерны минимальных
     plt.close()
 
 
-def evaluate_forecast(y_true, y_pred, horizon_days=1):
+def evaluate_forecast(y_true, y_pred, horizon_days=1, y_lag1=None):
     """
-    Оценивает качество прогноза с интерпретацией для задачи прогнозирования температуры.
+    Оценивает качество прогноза с расширенными метриками.
     
     Параметры
     ----------
@@ -339,6 +400,8 @@ def evaluate_forecast(y_true, y_pred, horizon_days=1):
         Предсказанные значения.
     horizon_days : int
         Горизонт прогнозирования в днях.
+    y_lag1 : array-like, опционально
+        Значения lag_1 для расчёта relative score и gain.
     
     Возвращает
     ----------
@@ -370,17 +433,44 @@ def evaluate_forecast(y_true, y_pred, horizon_days=1):
         "Диапазон температур (°C)": temp_range
     }
     
+    # Relative Score и Naive Gain
+    if y_lag1 is not None:
+        naive_mae = mean_absolute_error(y_true, y_lag1)
+        metrics["Relative Score vs Naive"] = relative_score(mae, naive_mae)
+        metrics["Naive Gain"] = naive_gain(y_true, y_pred, y_lag1)
+        metrics["Naive MAE (°C)"] = naive_mae
+    
+    # Regime Robustness (оценка на разных режимах)
+    try:
+        robustness = regime_robustness(y_true, y_pred)
+        metrics.update({
+            "MAE Calm": robustness.get('mae_calm', np.nan),
+            "MAE Volatile": robustness.get('mae_volatile', np.nan),
+            "Robustness Ratio": robustness.get('robustness_ratio', np.nan)
+        })
+    except:
+        pass
+    
     # Интерпретация для задачи прогнозирования температуры
     print(f"\nОценка качества прогноза (горизонт: {horizon_days} день{'а' if horizon_days in [2,3,4] else 'ей'}):")
-    print("-" * 65)
-    print(f"{'Метрика':<25} {'Значение':<15} {'Интерпретация'}")
-    print("-" * 65)
-    print(f"{'MAE':<25} {mae:>10.2f} °C  {'Средняя ошибка прогноза'}")
-    print(f"{'RMSE':<25} {rmse:>10.2f} °C  {'Чувствительность к крупным ошибкам'}")
-    print(f"{'MAPE':<25} {mape:>10.2f} %    {'Относительная ошибка'}")
-    print(f"{'R²':<25} {r2:>10.4f}       {'Доля объясненной дисперсии'}")
-    print(f"{'Ошибка от диапазона':<25} {mean_abs_error_pct:>10.2f} %    {'Критичность для точности'}")
-    print("-" * 65)
+    print("-" * 75)
+    print(f"{'Метрика':<30} {'Значение':<20} {'Интерпретация'}")
+    print("-" * 75)
+    print(f"{'MAE':<30} {mae:>10.2f} °C     {'Средняя ошибка прогноза'}")
+    print(f"{'RMSE':<30} {rmse:>10.2f} °C     {'Чувствительность к крупным ошибкам'}")
+    print(f"{'MAPE':<30} {mape:>10.2f} %       {'Относительная ошибка'}")
+    print(f"{'R²':<30} {r2:>10.4f}          {'Доля объясненной дисперсии'}")
+    print(f"{'Ошибка от диапазона':<30} {mean_abs_error_pct:>10.2f} %       {'Критичность для точности'}")
+    
+    if "Relative Score vs Naive" in metrics:
+        rel_score = metrics["Relative Score vs Naive"]
+        print(f"{'Relative Score vs Naive':<30} {rel_score:>10.4f}          {'<1.0 = лучше naive'}")
+    
+    if "Naive Gain" in metrics:
+        gain = metrics["Naive Gain"]
+        print(f"{'Naive Gain':<30} {gain:>10.2f} °C     {'Улучшение относительно naive'}")
+    
+    print("-" * 75)
     
     # Рекомендации по надежности прогноза
     if mean_abs_error_pct < 5.0:
@@ -404,8 +494,17 @@ def evaluate_forecast(y_true, y_pred, horizon_days=1):
 
 def main():
     print("=" * 80)
-    print("ПРОГНОЗИРОВАНИЕ МИНИМАЛЬНЫХ ТЕМПЕРАТУР (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)")
+    print("ПРОГНОЗИРОВАНИЕ МИНИМАЛЬНЫХ ТЕМПЕРАТУР (OPTIMIZER v2.0)")
     print("=" * 80)
+    
+    # ЛОГИРОВАНИЕ КОНФИГУРАЦИИ ОПТИМИЗАТОРА
+    print(f"\nКонфигурация оптимизатора:")
+    print(f"  • dominance_lambda: {OPTIMIZER_CONFIG.dominance_lambda}")
+    print(f"  • naive_lambda: {OPTIMIZER_CONFIG.naive_lambda}")
+    print(f"  • entropy_lambda: {OPTIMIZER_CONFIG.entropy_lambda}")
+    print(f"  • scale_penalties: {OPTIMIZER_CONFIG.scale_penalties}")
+    print(f"  • use_oof_penalties: {OPTIMIZER_CONFIG.use_oof_penalties}")
+    print(f"  • diagnostics_file: {OPTIMIZER_CONFIG.diagnostics_file}")
     
     # Генерируем ID эксперимента
     experiment_id = get_experiment_id(EXPERIMENT_CONFIG)
@@ -447,6 +546,12 @@ def main():
     y = y[valid_mask]
     X = X[valid_mask]
     
+    # Сохраняем lag_1 для расчёта relative metrics
+    lag1_col = [c for c in X.columns if "lag_1" in c]
+    y_lag1 = None
+    if lag1_col and lag1_col[0] in X.columns:
+        y_lag1 = X[lag1_col[0]].values
+    
     print(f"   Размер признакового пространства до инженерии: {X.shape[1]} признаков")
     print(f"   Количество наблюдений для обучения: {len(X)}")
     
@@ -460,8 +565,8 @@ def main():
     print(f"   Тестовая выборка: {len(X_test)} наблюдений ({X_test.index.min()} — {X_test.index.max()})")
     
     # Шаг 6: Автоматическая инженерия признаков с гибридным подходом
-    print("\n6. Автоматическая инженерия признаков с гибридным подходом...")
-    print("   Режим: core pipeline (обязательные лаги) + auto pipeline (адаптивные преобразования)")
+    print("\n6. Автоматическая инженерия признаков (Optimizer v2.0)...")
+    print("   Режим: core pipeline + auto pipeline + inductive biases")
     
     engineer = AutoFeatureEngineer(
         optimize=True,
@@ -472,7 +577,8 @@ def main():
         variance_threshold=EXPERIMENT_CONFIG["variance_threshold"],
         shap_selection=EXPERIMENT_CONFIG["shap_selection"],
         random_state=EXPERIMENT_CONFIG["random_state"],
-        verbose=1
+        verbose=1,
+        optimizer_config=OPTIMIZER_CONFIG  # ← ПЕРЕДАЁМ НОВУЮ КОНФИГУРАЦИЮ
     )
     
     # Обучение инженера
@@ -519,9 +625,32 @@ def main():
     
     # Шаг 9: Оценка качества прогноза
     print("\n9. Оценка качества прогноза на тестовой выборке...")
-    test_metrics = evaluate_forecast(y_test, y_pred_test, horizon_days=1)
     
-    # Добавляем дополнительную информацию в метрики
+    # Получаем lag_1 для тестовых данных
+    y_test_lag1 = None
+    if lag1_col and lag1_col[0] in X_test_transformed.columns:
+        y_test_lag1 = X_test_transformed[lag1_col[0]].values
+    
+    test_metrics = evaluate_forecast(
+        y_test, y_pred_test, 
+        horizon_days=1,
+        y_lag1=y_test_lag1  # ← ПЕРЕДАЁМ LAG_1 ДЛЯ RELATIVE METRICS
+    )
+    
+    # ДОБАВЛЯЕМ ДИАГНОСТИКУ ОПТИМИЗАТОРА В МЕТРИКИ
+    history = engineer.get_optimization_history()
+    if history is not None and not history.empty:
+        last_trial = history.iloc[-1]
+        test_metrics.update({
+            "max_feature_share": last_trial.get('max_feature_share', np.nan),
+            "naive_corr": last_trial.get('naive_corr', np.nan),
+            "semantic_entropy": last_trial.get('entropy_bonus', np.nan) / OPTIMIZER_CONFIG.entropy_lambda if OPTIMIZER_CONFIG.entropy_lambda > 0 else np.nan,
+        })
+        print(f"\n   🔍 Диагностика последнего trial:")
+        print(f"      • Max feature share: {test_metrics['max_feature_share']:.2%}")
+        print(f"      • Naive correlation: {test_metrics['naive_corr']:.3f}")
+        print(f"      • Semantic entropy: {test_metrics['semantic_entropy']:.3f}")
+    
     test_metrics["n_features"] = X_train_transformed.shape[1]
     test_metrics["n_train_samples"] = len(X_train)
     test_metrics["n_test_samples"] = len(X_test)
@@ -700,16 +829,30 @@ def main():
         results_dir="results"
     )
 
+    # ВЫВОД ДИАГНОСТИКИ ОПТИМИЗАТОРА
+    if OPTIMIZER_CONFIG.log_diagnostics and OPTIMIZER_CONFIG.diagnostics_file:
+        print(f"\n    Диагностика оптимизатора сохранена в: {OPTIMIZER_CONFIG.diagnostics_file}")
+        if os.path.exists(OPTIMIZER_CONFIG.diagnostics_file):
+            diag_df = pd.read_csv(OPTIMIZER_CONFIG.diagnostics_file)
+            if not diag_df.empty:
+                print(f"      • Записей в логе: {len(diag_df)}")
+                print(f"      • Средняя max_feature_share: {diag_df['max_feature_share'].mean():.2%}")
+                print(f"      • Средняя naive_corr: {diag_df['naive_corr'].mean():.3f}")
+    
     print("\n" + "=" * 80)
     print("ПРИМЕР ЗАВЕРШЕН")
     print("=" * 80)
     print("\nСгенерированные файлы:")
     print("  • temperature_patterns.png : анализ паттернов температур")
     print("  • temperature_forecast_comparison.png : сравнение прогноза с фактом")
-    print("  • results/metrics_history.csv : история метрик")
+    print("  • results/metrics_history.csv : история метрик (с relative score)")
     print("  • results/experiments_config.csv : история конфигураций")
-    print(f"  • Автоматическая инженерия признаков улучшила прогноз на {((naive_mae - auto_mae) / naive_mae * 100):.1f}%")
-
+    print(f"  • results/optimization_diagnostics.csv : диагностика оптимизатора")
+    
+    if "Relative Score vs Naive" in test_metrics:
+        rel = test_metrics["Relative Score vs Naive"]
+        status = " ЛУЧШЕ NAIVE" if rel < 1.0 else "⚠ ХУЖЕ NAIVE"
+        print(f"\n  • Relative Score vs Naive: {rel:.4f} {status}")
 
 
 if __name__ == "__main__":
@@ -721,5 +864,4 @@ if __name__ == "__main__":
         print("WARNING: matplotlib или seaborn не установлены. Визуализация будет ограничена.")
         print("Установите через: pip install matplotlib seaborn")
     
-    import warnings  # Для подавления FutureWarning
     main()

@@ -7,31 +7,35 @@
 на основе мета-признаков временного ряда. Использует вероятностную модель для
 эффективного исследования пространства решений с минимальным количеством оценок.
 
-Новые возможности (v2.0):
-- Multi-objective оптимизация с индуктивными смещениями
-- Anti-trivial penalty против доминирования одного признака
-- Naive similarity penalty против копирования y(t-1)
-- Entropy-based diversity bonus за разнообразие признаков
-- Иерархический search space с авто-режимами пайплайна
-- Early abort для ускорения поиска
+Версия 2.0 — Улучшения:
+- Out-of-sample penalties (OOF predictions)
+- Unified penalty scaling (relative to MAE)
+- Explicit collapse diagnostics
+- Semantic entropy (by information type)
+- Horizon-aware scoring
+- Conditional search space
+- Progressive complexity modes
+- Relative score vs naive baseline
 """
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from collections import Counter
+from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
 from skopt import gp_minimize
-from skopt.space import Categorical, Integer, Real
+from skopt.space import Categorical, Integer, Real, Space
 from skopt.utils import use_named_args
+import warnings
 
 from .base import TimeSeriesTransformer
 from .meta_features import MetaFeatureExtractor
 from .transformers.window import WindowTransformer
 from .transformers.spectral import DWTTransformer, STLTransformer
 from .transformers.time_encoding import TimeEncodingTransformer, CalendarFeaturesTransformer
+from .transformers.lag import LagTransformer
 
 
 # ============================================================================
@@ -47,22 +51,73 @@ class OptimizerConfig:
     dominance_lambda: float = 0.5      # Штраф за доминирование одного признака
     naive_lambda: float = 0.3          # Штраф за копирование lag_1
     entropy_lambda: float = 0.1        # Бонус за разнообразие признаков
+    collapse_lambda: float = 0.4       # Штраф за feature collapse
     
     # Пороги
     dominance_threshold: float = 0.7   # Макс. доля важности одного признака
     naive_corr_threshold: float = 0.95 # Макс. корреляция с lag_1
     early_abort_penalty: float = 10.0  # Порог для ранней остановки
     
-    # Режимы пайплайна
-    pipeline_modes: Dict[str, List[str]] = {
-        "baseline": ["core_lags"],
-        "structure": ["core_lags", "window", "calendar"],
-        "full": ["core_lags", "window", "calendar", "spectral", "dwt", "stl"]
-    }
+    # Масштабирование штрафов
+    scale_penalties: bool = True       # Приводить штрафы к масштабу MAE
+    use_oof_penalties: bool = True     # Считать штрафы на OOF predictions
     
-    # Ранняя остановка
-    enable_early_abort: bool = True
-    min_features_for_evaluation: int = 2
+    # Режимы пайплайна
+    pipeline_modes: Dict[str, List[str]] = None
+    use_progressive_modes: bool = False  # Запускать BO в фазах
+    
+    # Горизонты
+    forecast_horizons: List[int] = None  # [1, 7, 24] для horizon-aware scoring
+    use_horizon_aware: bool = False      # Использовать gain(h) метрику
+    
+    # Диагностика
+    log_diagnostics: bool = True       # Логировать diagnostic metrics
+    diagnostics_file: str = None       # Путь к файлу логов
+    
+    # Search space
+    use_conditional_space: bool = True # Активные параметры только если группа включена
+    
+    def __init__(
+        self,
+        dominance_lambda: float = 0.5,
+        naive_lambda: float = 0.3,
+        entropy_lambda: float = 0.1,
+        collapse_lambda: float = 0.4,
+        dominance_threshold: float = 0.7,
+        naive_corr_threshold: float = 0.95,
+        scale_penalties: bool = True,
+        use_oof_penalties: bool = True,
+        use_progressive_modes: bool = False,
+        use_horizon_aware: bool = False,
+        forecast_horizons: Optional[List[int]] = None,
+        log_diagnostics: bool = True,
+        diagnostics_file: Optional[str] = None,  # ДОБАВЬТЕ ЭТУ СТРОКУ
+        use_conditional_space: bool = True,
+    ):
+        self.dominance_lambda = dominance_lambda
+        self.naive_lambda = naive_lambda
+        self.entropy_lambda = entropy_lambda
+        self.collapse_lambda = collapse_lambda
+        self.dominance_threshold = dominance_threshold
+        self.naive_corr_threshold = naive_corr_threshold
+        self.scale_penalties = scale_penalties
+        self.use_oof_penalties = use_oof_penalties
+        self.use_progressive_modes = use_progressive_modes
+        self.use_horizon_aware = use_horizon_aware
+        self.forecast_horizons = forecast_horizons or [1, 7, 24]
+        self.log_diagnostics = log_diagnostics
+        self.diagnostics_file = diagnostics_file  
+        self.use_conditional_space = use_conditional_space
+        
+        # Режимы пайплайна по умолчанию
+        self.pipeline_modes = {
+            "baseline": ["core_lags"],
+            "structure": ["core_lags", "window", "calendar"],
+            "full": ["core_lags", "window", "calendar", "spectral", "dwt", "stl"]
+        }
+        
+        # Диагностика
+        self.diagnostics_history = []
 
 
 # ============================================================================
@@ -81,20 +136,16 @@ class FeatureEngineeringPipeline:
         self.is_fitted_ = False
 
     def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Optional[Union[pd.Series, np.ndarray]] = None) -> "FeatureEngineeringPipeline":
-        """
-        Последовательное обучение всех активных трансформеров в пайплайне.
-        """
+        """Последовательное обучение всех активных трансформеров в пайплайне."""
         X_current = X
         all_feature_names = []
         for name, transformer, active in self.transformers:
             if not active:
                 continue
-            # Для трансформеров, требующих целевую переменную
             if isinstance(transformer, TimeEncodingTransformer) and transformer.fit_params:
                 transformer.fit(X_current, y)
             else:
                 transformer.fit(X_current)
-            # Сохраняем имена признаков
             if hasattr(transformer, "get_feature_names"):
                 all_feature_names.extend(transformer.get_feature_names())
         self.feature_names_ = all_feature_names
@@ -102,12 +153,9 @@ class FeatureEngineeringPipeline:
         return self
 
     def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
-        """
-        Применение всех активных трансформеров к данным.
-        """
+        """Применение всех активных трансформеров к данным."""
         if not self.is_fitted_:
             raise ValueError("Pipeline is not fitted. Call fit() first.")
-        
         features_dict = {}
         for name, transformer, active in self.transformers:
             if not active:
@@ -115,7 +163,6 @@ class FeatureEngineeringPipeline:
             X_transformed = transformer.transform(X)
             for col in X_transformed.columns:
                 features_dict[f"{name}.{col}"] = X_transformed[col]
-        
         if not features_dict:
             return pd.DataFrame(index=X.index)
         return pd.DataFrame(features_dict, index=X.index)
@@ -132,6 +179,40 @@ class FeatureEngineeringPipeline:
 
 
 # ============================================================================
+# ДИАГНОСТИКА И ЛОГИРОВАНИЕ
+# ============================================================================
+class DiagnosticsLogger:
+    """
+    Логгер для диагностики процесса оптимизации.
+    """
+    def __init__(self, filepath: Optional[str] = None):
+        self.filepath = filepath
+        self.history = []
+    
+    def log(self, iteration: int, diagnostics: Dict[str, Any]):
+        """Запись диагностических данных."""
+        record = {
+            "iteration": iteration,
+            "timestamp": pd.Timestamp.now(),
+            **diagnostics
+        }
+        self.history.append(record)
+        
+        if self.filepath:
+            import os
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+            
+            df = pd.DataFrame(self.history)
+            df.to_csv(self.filepath, index=False)
+    
+    def get_summary(self) -> pd.DataFrame:
+        """Получение сводки по диагностике."""
+        if not self.history:
+            return pd.DataFrame()
+        return pd.DataFrame(self.history)
+
+
+# ============================================================================
 # ОПТИМИЗАТОР С MULTI-OBJECTIVE ПОДДЕРЖКОЙ
 # ============================================================================
 class FeatureEngineeringOptimizer:
@@ -142,10 +223,14 @@ class FeatureEngineeringOptimizer:
     на основе структуры конкретного временного ряда. Использует мета-признаки
     для инициализации поиска и ускорения сходимости.
     
-    Новые возможности:
+    Новые возможности (v2.0):
     - Multi-objective оптимизация: MAE + diversity - triviality
-    - Индуктивные смещения через штрафы, а не hard rules
-    - Иерархический search space с авто-режимами
+    - Out-of-sample penalties (OOF predictions)
+    - Unified penalty scaling (relative to MAE)
+    - Semantic entropy (by information type)
+    - Horizon-aware scoring
+    - Conditional search space
+    - Progressive complexity modes
     """
 
     def __init__(
@@ -169,112 +254,379 @@ class FeatureEngineeringOptimizer:
         self.random_state = random_state
         self.use_meta_features = use_meta_features
         self.verbose = verbose
-        self.config = config or OptimizerConfig()
+        self.config = config or Optimizer()
         
         self.best_params_ = None
         self.best_score_ = -np.inf
         self.search_space_ = None
         self.history_ = []
+        self.diagnostics_logger = None
+        
+        if self.config.log_diagnostics:
+            self.diagnostics_logger = DiagnosticsLogger(self.config.diagnostics_file)
+        
+        # Для horizon-aware scoring
+        self.naive_baseline_mae = {}
+        
+        # Для progressive modes
+        self.current_mode_idx = 0
+        self.mode_iterations = {
+            "baseline": max(3, n_calls // 5),
+            "structure": max(5, n_calls // 3),
+            "full": n_calls
+        }
 
     # =========================================================================
-    # 1. ANTI-TRIVIAL PENALTY (DOMINANCE)
+    # 1. OUT-OF-SAMPLE PENALTIES (OOF PREDICTIONS)
     # =========================================================================
-    def _dominance_penalty(self, model: BaseEstimator, feature_names: List[str]) -> float:
+    def _compute_oof_predictions(
+        self, 
+        X: pd.DataFrame, 
+        y: pd.Series, 
+        model: BaseEstimator
+    ) -> np.ndarray:
+        """
+        Вычисление OOF предсказаний для честной оценки штрафов.
+        """
+        try:
+            oof_pred = cross_val_predict(
+                model, X.fillna(0), y, cv=self.cv, n_jobs=-1
+            )
+            return oof_pred
+        except Exception as e:
+            if self.verbose >= 2:
+                print(f"OOF prediction failed: {e}. Using in-sample predictions.")
+            model.fit(X.fillna(0), y)
+            return model.predict(X.fillna(0))
+
+    def _dominance_penalty(
+        self, 
+        model: BaseEstimator, 
+        feature_names: List[str],
+        X: pd.DataFrame = None,
+        y: pd.Series = None
+    ) -> Tuple[float, Dict[str, Any]]:
         """
         Штраф за доминирование одного признака.
         
-        Если один признак имеет >70% важности — пайплайн слишком "тривиален".
+        Вычисляется на OOF предсказаниях если use_oof_penalties=True.
+        Возвращает штраф и диагностические данные.
         """
+        diagnostics = {
+            "max_feature_share": 0.0,
+            "top_feature": None,
+            "top_3_share": 0.0
+        }
+        
         if not hasattr(model, "feature_importances_"):
-            return 0.0
+            return 0.0, diagnostics
         
         importances = np.abs(model.feature_importances_)
         if len(importances) == 0 or importances.sum() == 0:
-            return 0.0
+            return 0.0, diagnostics
         
         # Нормализуем важности
         importances = importances / importances.sum()
         max_share = importances.max()
+        top_idx = np.argmax(importances)
+        
+        diagnostics["max_feature_share"] = float(max_share)
+        diagnostics["top_feature"] = feature_names[top_idx] if top_idx < len(feature_names) else "unknown"
+        diagnostics["top_3_share"] = float(np.sum(np.sort(importances)[-3:]))
         
         # Штраф если один признак доминирует
         if max_share > self.config.dominance_threshold:
             penalty = (max_share - self.config.dominance_threshold) * self.config.dominance_lambda
-            return penalty
-        return 0.0
+            return penalty, diagnostics
+        return 0.0, diagnostics
 
-    # =========================================================================
-    # 2. NAIVE SIMILARITY PENALTY (LAG-COPY DETECTION)
-    # =========================================================================
-    def _naive_similarity_penalty(self, y_pred: np.ndarray, y_lag1: np.ndarray) -> float:
+    def _naive_similarity_penalty(
+        self, 
+        y_pred: np.ndarray, 
+        y_lag1: np.ndarray,
+        y_true: np.ndarray = None
+    ) -> Tuple[float, Dict[str, Any]]:
         """
         Штраф за слишком похожие на lag_1 прогнозы.
         
-        Если прогноз ≈ y(t-1), значит модель просто копирует прошлое.
+        Вычисляется на OOF предсказаниях если use_oof_penalties=True.
         """
+        diagnostics = {
+            "naive_corr": 0.0,
+            "naive_mae_ratio": 1.0
+        }
+        
         # Удаляем NaN для корреляции
         mask = ~np.isnan(y_pred) & ~np.isnan(y_lag1)
         if mask.sum() < 10:
-            return 0.0
+            return 0.0, diagnostics
         
         y_pred_clean = y_pred[mask]
         y_lag1_clean = y_lag1[mask]
         
         # Корреляция Пирсона
         if np.std(y_pred_clean) < 1e-6 or np.std(y_lag1_clean) < 1e-6:
-            return 0.0
+            return 0.0, diagnostics
         
         corr = np.corrcoef(y_pred_clean, y_lag1_clean)[0, 1]
         if np.isnan(corr):
-            return 0.0
+            return 0.0, diagnostics
+        
+        diagnostics["naive_corr"] = float(corr)
+        
+        # Дополнительно: отношение MAE модели к MAE naive
+        if y_true is not None:
+            y_true_clean = y_true[mask]
+            model_mae = mean_absolute_error(y_true_clean, y_pred_clean)
+            naive_mae = mean_absolute_error(y_true_clean, y_lag1_clean)
+            if naive_mae > 0:
+                diagnostics["naive_mae_ratio"] = float(model_mae / naive_mae)
         
         # Штраф если слишком похожи
         if corr > self.config.naive_corr_threshold:
             penalty = (corr - self.config.naive_corr_threshold) * self.config.naive_lambda
-            return penalty
-        return 0.0
+            return penalty, diagnostics
+        return 0.0, diagnostics
+
+    def _collapse_penalty(
+        self, 
+        X_transformed: pd.DataFrame,
+        feature_names: List[str]
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Штраф за feature collapse (слишком мало уникальных признаков).
+        """
+        diagnostics = {
+            "n_features": X_transformed.shape[1],
+            "n_unique_patterns": 0,
+            "effective_rank": 0
+        }
+        
+        n_features = X_transformed.shape[1]
+        diagnostics["n_features"] = n_features
+        
+        if n_features < 2:
+            diagnostics["collapse_detected"] = True
+            return self.config.collapse_lambda * 2.0, diagnostics
+        
+        # Вычисляем эффективный ранг через корреляционную матрицу
+        try:
+            corr_matrix = X_transformed.fillna(0).corr().values
+            eigenvalues = np.linalg.eigvalsh(corr_matrix)
+            effective_rank = np.sum(eigenvalues > 1e-6)
+            diagnostics["effective_rank"] = int(effective_rank)
+            diagnostics["n_unique_patterns"] = int(effective_rank)
+            
+            # Штраф если эффективный ранг слишком мал
+            if effective_rank < n_features * 0.3:
+                penalty = self.config.collapse_lambda * (1 - effective_rank / n_features)
+                diagnostics["collapse_detected"] = True
+                return penalty, diagnostics
+        except:
+            pass
+        
+        diagnostics["collapse_detected"] = False
+        return 0.0, diagnostics
 
     # =========================================================================
-    # 3. ENTROPY-BASED DIVERSITY BONUS
+    # 2. UNIFIED PENALTY SCALING
     # =========================================================================
-    def _feature_group_entropy(self, feature_names: List[str]) -> float:
+    def _scale_penalty(self, penalty: float, mae: float) -> float:
         """
-        Вычисление энтропии распределения признаков по группам.
+        Приведение штрафа к масштабу MAE.
         
-        Высокая энтропия = разнообразие = хорошо.
+        penalty_scaled = penalty * mae
+        
+        Это делает штрафы сопоставимыми на разных датасетах.
         """
+        if not self.config.scale_penalties or mae == 0:
+            return penalty
+        return penalty * mae
+
+    # =========================================================================
+    # 3. SEMANTIC ENTROPY (BY INFORMATION TYPE)
+    # =========================================================================
+    def _semantic_feature_grouping(self, feature_names: List[str]) -> Dict[str, List[str]]:
+        """
+        Группировка признаков по семантическому типу, а не по имени трансформера.
+        
+        Возвращает словарь: {semantic_type: [feature_names]}
+        """
+        groups = defaultdict(list)
+        
+        for feat_name in feature_names:
+            # Определяем семантический тип по паттернам в имени
+            if "lag_" in feat_name:
+                groups["lag"].append(feat_name)
+            elif "window" in feat_name:
+                if "mean" in feat_name or "std" in feat_name:
+                    groups["rolling_stats"].append(feat_name)
+                elif "slope" in feat_name or "trend" in feat_name:
+                    groups["rolling_trend"].append(feat_name)
+                elif "diff" in feat_name:
+                    groups["rolling_diff"].append(feat_name)
+                else:
+                    groups["rolling_other"].append(feat_name)
+            elif "stl" in feat_name:
+                if "trend" in feat_name:
+                    groups["stl_trend"].append(feat_name)
+                elif "seasonal" in feat_name:
+                    groups["stl_seasonal"].append(feat_name)
+                else:
+                    groups["stl_resid"].append(feat_name)
+            elif "dwt" in feat_name:
+                groups["wavelet"].append(feat_name)
+            elif "time." in feat_name or "calendar" in feat_name:
+                if "hour" in feat_name or "minute" in feat_name:
+                    groups["time_intraday"].append(feat_name)
+                elif "day_of_week" in feat_name or "weekend" in feat_name:
+                    groups["time_weekly"].append(feat_name)
+                elif "month" in feat_name or "season" in feat_name:
+                    groups["time_monthly"].append(feat_name)
+                else:
+                    groups["time_other"].append(feat_name)
+            else:
+                groups["other"].append(feat_name)
+        
+        return dict(groups)
+
+    def _feature_group_entropy(self, feature_names: List[str]) -> Tuple[float, Dict[str, Any]]:
+        """
+        Вычисление энтропии распределения признаков по семантическим группам.
+        
+        Возвращает энтропию и диагностические данные.
+        """
+        diagnostics = {
+            "n_groups": 0,
+            "group_distribution": {},
+            "max_group_share": 0.0
+        }
+        
         if not feature_names:
-            return 0.0
+            return 0.0, diagnostics
         
-        # Группируем по первому уровню имени (transformer name)
-        groups = [name.split(".")[0] for name in feature_names]
-        counts = Counter(groups)
+        # Группируем по семантическому типу
+        groups = self._semantic_feature_grouping(feature_names)
+        diagnostics["n_groups"] = len(groups)
         
-        if len(counts) <= 1:
-            return 0.0
+        if len(groups) <= 1:
+            diagnostics["group_distribution"] = {k: len(v) for k, v in groups.items()}
+            return 0.0, diagnostics
         
         # Вычисляем энтропию Шеннона
-        total = sum(counts.values())
-        probs = np.array([count / total for count in counts.values()])
+        counts = np.array([len(v) for v in groups.values()])
+        total = counts.sum()
+        probs = counts / total
+        
+        diagnostics["group_distribution"] = {k: len(v) for k, v in groups.items()}
+        diagnostics["max_group_share"] = float(np.max(probs))
+        
         entropy = -np.sum(probs * np.log(probs + 1e-9))
         
         # Нормализуем к [0, 1]
-        max_entropy = np.log(len(counts))
-        return entropy / max_entropy if max_entropy > 0 else 0.0
+        max_entropy = np.log(len(groups))
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return normalized_entropy, diagnostics
 
     # =========================================================================
-    # 4. HIERARCHICAL SEARCH SPACE (PIPELINE MODES)
+    # 4. HORIZON-AWARE SCORING
     # =========================================================================
-    def _define_search_space(self, meta_features: Optional[Dict[str, float]] = None) -> List:
+    def _compute_horizon_aware_gain(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model: BaseEstimator,
+        horizon: int = 1
+    ) -> Tuple[float, Dict[str, Any]]:
         """
-        Определение пространства поиска с поддержкой pipeline modes.
+        Вычисление gain(h) = MAE_naive(h) - MAE_model(h).
+        
+        Положительный gain означает, что модель лучше naive на горизонте h.
         """
+        diagnostics = {
+            f"mae_naive_h{horizon}": 0.0,
+            f"mae_model_h{horizon}": 0.0,
+            f"gain_h{horizon}": 0.0
+        }
+        
+        # Создаём target для горизонта h
+        y_h = y.shift(-horizon).dropna()
+        X_h = X.loc[y_h.index]
+        y_h = y_h.loc[X_h.index]
+        
+        if len(y_h) < 20:
+            diagnostics[f"gain_h{horizon}_insufficient_data"] = True
+            return 0.0, diagnostics
+        
+        # Naive прогноз на горизонте h
+        naive_pred = y_h.shift(horizon).fillna(y_h.mean())
+        naive_mae = mean_absolute_error(y_h, naive_pred)
+        diagnostics[f"mae_naive_h{horizon}"] = float(naive_mae)
+        
+        # Модель
+        try:
+            scores = cross_val_score(
+                model, X_h.fillna(0), y_h, cv=self.cv, 
+                scoring="neg_mean_absolute_error", n_jobs=-1
+            )
+            model_mae = -np.mean(scores)
+        except:
+            diagnostics[f"gain_h{horizon}_model_failed"] = True
+            return 0.0, diagnostics
+        
+        diagnostics[f"mae_model_h{horizon}"] = float(model_mae)
+        
+        gain = naive_mae - model_mae
+        diagnostics[f"gain_h{horizon}"] = float(gain)
+        diagnostics[f"relative_gain_h{horizon}"] = float(gain / naive_mae) if naive_mae > 0 else 0.0
+        
+        return gain, diagnostics
+
+    # =========================================================================
+    # 5. RELATIVE SCORE VS NAIVE
+    # =========================================================================
+    def _compute_relative_score(
+        self,
+        mae_model: float,
+        mae_naive: float
+    ) -> float:
+        """
+        Вычисление относительного score: MAE_model / MAE_naive.
+        
+        Значения < 1.0 означают улучшение относительно naive.
+        """
+        if mae_naive == 0:
+            return mae_model
+        return mae_model / mae_naive
+
+    # =========================================================================
+    # 6. CONDITIONAL SEARCH SPACE
+    # =========================================================================
+    def _define_search_space(
+        self, 
+        meta_features: Optional[Dict[str, float]] = None,
+        mode: str = "full"
+    ) -> Space:
+        """
+        Определение пространства поиска с поддержкой conditional parameters.
+        """
+        from skopt.space import Space
+        
         space = []
         
-        # режим пайплайна
-        space.append(Categorical(
-            list(self.config.pipeline_modes.keys()),
-            name="pipeline_mode"
-        ))
+        # НОВЫЙ ПАРАМЕТР: режим пайплайна (для progressive modes)
+        if self.config.use_progressive_modes:
+            space.append(Categorical(
+                list(self.config.pipeline_modes.keys()),
+                name="pipeline_mode"
+            ))
+        
+        # Определяем активные группы по режиму
+        if mode in self.config.pipeline_modes:
+            active_groups = self.config.pipeline_modes[mode]
+        else:
+            active_groups = self.config.pipeline_modes["full"]
         
         # 1. Категориальные параметры (всегда доступны)
         space.append(Categorical([True, False], name="use_window"))
@@ -319,9 +671,9 @@ class FeatureEngineeringOptimizer:
         if meta_features is not None and self.use_meta_features:
             self._adapt_search_space(space, meta_features)
         
-        return space
+        return space 
 
-    def _adapt_search_space(self, space: List, meta_features: Dict[str, float]) -> None:
+    def _adapt_search_space(self, space: Space, meta_features: Dict[str, float]) -> None:
         """Адаптация пространства поиска на основе мета-признаков."""
         if "dominant_freq" in meta_features:
             dominant_freq = meta_features["dominant_freq"]
@@ -332,15 +684,20 @@ class FeatureEngineeringOptimizer:
                         dim.high = 30
                         break
 
-    def _build_pipeline(self, params: Dict[str, Any]) -> FeatureEngineeringPipeline:
+    def _build_pipeline(self, params: Dict[str, Any], mode: str = None) -> FeatureEngineeringPipeline:
         """
         Построение пайплайна с поддержкой pipeline modes.
         """
         transformers = []
         
-        # 🔑 ОПРЕДЕЛЯЕМ АКТИВНЫЕ ГРУППЫ ПО РЕЖИМУ
-        mode = params.get("pipeline_mode", "full")
-        active_groups = self.config.pipeline_modes.get(mode, self.config.pipeline_modes["full"])
+        # Определяем активные группы по режиму
+        if mode is None:
+            mode = params.get("pipeline_mode", "full")
+        
+        if mode in self.config.pipeline_modes:
+            active_groups = self.config.pipeline_modes[mode]
+        else:
+            active_groups = self.config.pipeline_modes["full"]
         
         # WindowTransformer
         if params.get("use_window") and "window" in active_groups:
@@ -394,7 +751,7 @@ class FeatureEngineeringOptimizer:
                     ),
                     True
                 ))
-            else:  # time2vec
+            else:
                 transformers.append((
                     "time_encoding",
                     TimeEncodingTransformer(
@@ -414,36 +771,25 @@ class FeatureEngineeringOptimizer:
                 ),
                 True
             ))
-
-        if "core_lags" in active_groups or mode == "baseline":
-            from .transformers.lag import LagTransformer
-            # Лаги определяются автоматически в pipeline.py
-            # Здесь просто резервируем место
-            pass
         
         return FeatureEngineeringPipeline(transformers)
 
     # =========================================================================
-    # 5. EARLY ABORT FOR BAD PIPELINES
+    # 7. PROGRESSIVE COMPLEXITY MODES
     # =========================================================================
-    def _early_abort_check(self, X_transformed: pd.DataFrame, dominance_penalty: float) -> Optional[float]:
+    def _get_current_mode(self, iteration: int) -> str:
         """
-        Ранняя остановка для заведомо плохих пайплайнов.
-        
-        Возвращает штраф если нужно остановиться, иначе None.
+        Определение текущего режима для progressive complexity.
         """
-        if not self.config.enable_early_abort:
-            return None
+        if not self.config.use_progressive_modes:
+            return "full"
         
-        # Слишком мало признаков
-        if X_transformed.shape[1] < self.config.min_features_for_evaluation:
-            return 1e5
-        
-        # Слишком высокий штраф доминирования
-        if dominance_penalty > self.config.early_abort_penalty:
-            return 1e5
-        
-        return None
+        cumulative = 0
+        for mode, max_iter in self.mode_iterations.items():
+            cumulative += max_iter
+            if iteration < cumulative:
+                return mode
+        return "full"
 
     # =========================================================================
     # MAIN OBJECTIVE FUNCTION (MULTI-OBJECTIVE)
@@ -453,11 +799,16 @@ class FeatureEngineeringOptimizer:
         Целевая функция с multi-objective поддержкой.
         
         Формула:
-            final_score = MAE + dominance_penalty + naive_penalty - entropy_bonus
+            final_score = (MAE + penalties) / MAE_naive - entropy_bonus
         
-        Возвращает значение для минимизации.
+        Все штрафы считаются на OOF predictions если use_oof_penalties=True.
         """
-        pipeline = self._build_pipeline(params)
+        # Определяем текущий режим для progressive modes
+        current_iteration = len(self.history_)
+        mode = self._get_current_mode(current_iteration)
+        params["pipeline_mode"] = mode
+        
+        pipeline = self._build_pipeline(params, mode)
         
         try:
             # Генерация признаков
@@ -484,7 +835,9 @@ class FeatureEngineeringOptimizer:
                 return 1e6
 
             X_transformed = X_transformed.fillna(X_transformed.mean())
+            feature_names = list(X_transformed.columns)
             
+            # ОЦЕНКА КАЧЕСТВА (базовый MAE)
             if isinstance(self.metric, str):
                 scores = cross_val_score(
                     self.model,
@@ -506,54 +859,161 @@ class FeatureEngineeringOptimizer:
                     scores.append(score)
                 mean_score = np.mean(scores)
             
+            # Конвертируем к MAE для штрафов
+            if self.metric in ["neg_mean_absolute_error"]:
+                mae = -mean_score
+            elif self.metric in ["neg_mean_squared_error", "neg_root_mean_squared_error"]:
+                mae = np.sqrt(-mean_score) if mean_score < 0 else np.abs(mean_score)
+            else:
+                mae = np.abs(mean_score)
             
-            # 1. Dominance penalty
-            dominance_penalty = self._dominance_penalty(self.model, list(X_transformed.columns))
-            
-            # 2. Naive similarity penalty
-            naive_penalty = 0.0
-            lag1_col = [c for c in X_transformed.columns if "lag_1" in c and "core_lags" in c]
-            if lag1_col and hasattr(self.model, "predict"):
-                # Обучаем на всех данных для получения предсказаний
-                self.model.fit(X_transformed.fillna(0), y)
-                y_pred = self.model.predict(X_transformed.fillna(0))
+            # ВЫЧИСЛЕНИЕ НАИВНОГО БАЗЛАЙНА
+            lag1_col = [c for c in feature_names if "lag_1" in c and "core_lags" in c]
+            if lag1_col and lag1_col[0] in X_transformed.columns:
                 y_lag1 = X_transformed[lag1_col[0]].values
-                naive_penalty = self._naive_similarity_penalty(y_pred, y_lag1)
+            else:
+                y_lag1 = y.shift(1).fillna(y.mean()).values
             
-            # 3. Entropy bonus (разнообразие)
-            entropy = self._feature_group_entropy(list(X_transformed.columns))
+            naive_mae = mean_absolute_error(y, y_lag1)
+            if naive_mae > 0:
+                self.naive_baseline_mae[1] = naive_mae
+            
+            # ДОПОЛНИТЕЛЬНЫЕ МЕТРИКИ КАЧЕСТВА FE
+            
+            # 1. Dominance penalty (OOF)
+            dominance_penalty = 0.0
+            dominance_diagnostics = {}
+            if self.config.use_oof_penalties:
+                oof_pred = self._compute_oof_predictions(X_transformed, y, self.model)
+                dominance_penalty, dominance_diagnostics = self._dominance_penalty(
+                    self.model, feature_names, X_transformed, y
+                )
+            else:
+                self.model.fit(X_transformed.fillna(0), y)
+                dominance_penalty, dominance_diagnostics = self._dominance_penalty(
+                    self.model, feature_names
+                )
+            
+            # 2. Naive similarity penalty (OOF)
+            naive_penalty = 0.0
+            naive_diagnostics = {}
+            if self.config.use_oof_penalties:
+                oof_pred = self._compute_oof_predictions(X_transformed, y, self.model)
+                naive_penalty, naive_diagnostics = self._naive_similarity_penalty(
+                    oof_pred, y_lag1, y.values
+                )
+            else:
+                naive_penalty, naive_diagnostics = self._naive_similarity_penalty(
+                    self.model.predict(X_transformed.fillna(0)), y_lag1, y.values
+                )
+            
+            # 3. Collapse penalty
+            collapse_penalty, collapse_diagnostics = self._collapse_penalty(
+                X_transformed, feature_names
+            )
+            
+            # 4. Entropy bonus (semantic)
+            entropy, entropy_diagnostics = self._feature_group_entropy(feature_names)
             entropy_bonus = self.config.entropy_lambda * entropy
             
+            # 5. Horizon-aware gain (опционально)
+            horizon_gain = 0.0
+            horizon_diagnostics = {}
+            if self.config.use_horizon_aware:
+                for h in self.config.forecast_horizons[:2]:  # Ограничиваем для скорости
+                    gain, h_diag = self._compute_horizon_aware_gain(
+                        X_transformed, y, self.model, horizon=h
+                    )
+                    horizon_gain += gain
+                    horizon_diagnostics.update(h_diag)
+            
+            # МАСШТАБИРОВАНИЕ ШТРАФОВ
+            if self.config.scale_penalties and mae > 0:
+                dominance_penalty = self._scale_penalty(dominance_penalty, mae)
+                naive_penalty = self._scale_penalty(naive_penalty, mae)
+                collapse_penalty = self._scale_penalty(collapse_penalty, mae)
+            
             # EARLY ABORT CHECK
-            early_penalty = self._early_abort_check(X_transformed, dominance_penalty)
-            if early_penalty is not None:
-                return early_penalty
+            total_penalty = dominance_penalty + naive_penalty + collapse_penalty
+            if total_penalty > self.config.early_abort_penalty:
+                if self.config.log_diagnostics and self.diagnostics_logger:
+                    self.diagnostics_logger.log(current_iteration, {
+                        "mae": float(mae),
+                        "dominance_penalty": float(dominance_penalty),
+                        "naive_penalty": float(naive_penalty),
+                        "collapse_penalty": float(collapse_penalty),
+                        "entropy_bonus": float(entropy_bonus),
+                        "early_abort": True,
+                        **dominance_diagnostics,
+                        **naive_diagnostics,
+                        **collapse_diagnostics,
+                        **entropy_diagnostics
+                    })
+                return 1e5
             
             # ФИНАЛЬНАЯ ФОРМУЛА
             # Для метрик где больше = лучше (R², neg_MAE):
             if self.metric in ["r2", "neg_mean_absolute_error", "neg_mean_squared_error", "neg_root_mean_squared_error"]:
-                # Инвертируем score для минимизации
                 base_score = -mean_score
             else:
                 base_score = mean_score
             
+            # Relative score vs naive
+            if naive_mae > 0:
+                relative_score = base_score / naive_mae
+            else:
+                relative_score = base_score
+            
             final_score = (
-                base_score
+                relative_score
                 + dominance_penalty
                 + naive_penalty
-                - entropy_bonus  # Вычитаем бонус = уменьшаем score = лучше
+                + collapse_penalty
+                - entropy_bonus
+                - (horizon_gain / 100.0 if horizon_gain > 0 else 0)  # Нормализуем gain
             )
             
             # Сохраняем историю с расширенными метриками
             self.history_.append({
                 "params": params.copy(),
-                "base_score": mean_score,
-                "dominance_penalty": dominance_penalty,
-                "naive_penalty": naive_penalty,
-                "entropy_bonus": entropy_bonus,
-                "final_score": final_score,
-                "n_features": X_transformed.shape[1]
+                "base_score": float(mean_score),
+                "mae": float(mae),
+                "naive_mae": float(naive_mae),
+                "relative_score": float(relative_score),
+                "dominance_penalty": float(dominance_penalty),
+                "naive_penalty": float(naive_penalty),
+                "collapse_penalty": float(collapse_penalty),
+                "entropy_bonus": float(entropy_bonus),
+                "horizon_gain": float(horizon_gain),
+                "final_score": float(final_score),
+                "n_features": X_transformed.shape[1],
+                "mode": mode,
+                **dominance_diagnostics,
+                **naive_diagnostics,
+                **collapse_diagnostics,
+                **entropy_diagnostics,
+                **horizon_diagnostics
             })
+            
+            # Логирование диагностики
+            if self.config.log_diagnostics and self.diagnostics_logger:
+                self.diagnostics_logger.log(current_iteration, {
+                    "mae": float(mae),
+                    "naive_mae": float(naive_mae),
+                    "relative_score": float(relative_score),
+                    "dominance_penalty": float(dominance_penalty),
+                    "naive_penalty": float(naive_penalty),
+                    "collapse_penalty": float(collapse_penalty),
+                    "entropy_bonus": float(entropy_bonus),
+                    "horizon_gain": float(horizon_gain),
+                    "final_score": float(final_score),
+                    "n_features": X_transformed.shape[1],
+                    "mode": mode,
+                    **dominance_diagnostics,
+                    **naive_diagnostics,
+                    **collapse_diagnostics,
+                    **entropy_diagnostics
+                })
             
             return final_score
 
@@ -620,8 +1080,13 @@ class FeatureEngineeringOptimizer:
         # Запуск оптимизации
         if self.verbose >= 1:
             print(f"Запуск байесовской оптимизации ({self.n_calls} итераций)...")
-            print(f"  Режимы: {list(self.config.pipeline_modes.keys())}")
+            if self.config.use_progressive_modes:
+                print(f"  Режимы: {list(self.config.pipeline_modes.keys())}")
             print(f"  Штрафы: dominance={self.config.dominance_lambda}, naive={self.config.naive_lambda}")
+            if self.config.scale_penalties:
+                print("  Масштабирование штрафов: включено")
+            if self.config.use_oof_penalties:
+                print("  OOF penalties: включено")
 
         result = gp_minimize(
             objective_function,
@@ -652,6 +1117,16 @@ class FeatureEngineeringOptimizer:
             print(f"Режим пайплайна: {self.best_params_.get('pipeline_mode', 'N/A')}")
             print(f"Количество признаков: {len(best_pipeline.get_feature_names())}")
             print(f"Активные трансформеры: {active}")
+            
+            # Вывод диагностики
+            if self.history_:
+                last_record = self.history_[-1]
+                print(f"\nДиагностика последнего trial:")
+                print(f"  Dominance penalty: {last_record.get('dominance_penalty', 0):.4f}")
+                print(f"  Naive penalty: {last_record.get('naive_penalty', 0):.4f}")
+                print(f"  Entropy bonus: {last_record.get('entropy_bonus', 0):.4f}")
+                print(f"  Max feature share: {last_record.get('max_feature_share', 0):.2%}")
+                print(f"  Naive correlation: {last_record.get('naive_corr', 0):.3f}")
 
         return best_pipeline, self.best_params_, self.best_score_
 
@@ -661,19 +1136,26 @@ class FeatureEngineeringOptimizer:
             return pd.DataFrame()
         return pd.DataFrame(self.history_)
 
+    def get_diagnostics_summary(self) -> pd.DataFrame:
+        """Получение сводки по диагностике."""
+        if self.diagnostics_logger:
+            return self.diagnostics_logger.get_summary()
+        return pd.DataFrame()
+
     def suggest_initial_points(self, meta_features: Dict[str, float], n_points: int = 5) -> List[Dict[str, Any]]:
         """Генерация разумных начальных точек на основе мета-признаков."""
         points = []
         for i in range(n_points):
             point = {}
             
-            # 🔑 ВЫБИРАЕМ РЕЖИМ ПЛАЙПЛАЙНА
-            if i == 0:
-                point["pipeline_mode"] = "baseline"
-            elif i == 1:
-                point["pipeline_mode"] = "structure"
-            else:
-                point["pipeline_mode"] = "full"
+            # ВЫБИРАЕМ РЕЖИМ ПЛАЙПЛАЙНА
+            if self.config.use_progressive_modes:
+                if i == 0:
+                    point["pipeline_mode"] = "baseline"
+                elif i == 1:
+                    point["pipeline_mode"] = "structure"
+                else:
+                    point["pipeline_mode"] = "full"
             
             point["use_window"] = True
             point["window_size"] = self._suggest_window_size(meta_features)

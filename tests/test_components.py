@@ -296,6 +296,40 @@ def test_auto_feature_engineer(X, y):
     
     return result
 
+def test_optimizer_config(X, y):
+    """Тест OptimizerConfig с новыми штрафами."""
+    from ts_feature_eng.optimization import OptimizerConfig, FeatureEngineeringOptimizer
+    
+    config = OptimizerConfig(
+        dominance_lambda=0.5,
+        naive_lambda=0.3,
+        entropy_lambda=0.1,
+        scale_penalties=True,
+        use_oof_penalties=False,  # Для скорости в тестах
+        log_diagnostics=True,
+    )
+    
+    optimizer = FeatureEngineeringOptimizer(
+        n_calls=2,
+        n_initial_points=1,
+        config=config,
+        verbose=0
+    )
+    
+    pipeline, params, score = optimizer.optimize(X, y)
+    
+    # Проверки
+    assert pipeline is not None
+    assert len(params) > 0
+    assert hasattr(optimizer, 'history_')
+    assert len(optimizer.history_) > 0
+    
+    # Проверка диагностики
+    if config.log_diagnostics:
+        assert 'max_feature_share' in optimizer.history_[0]
+        assert 'naive_corr' in optimizer.history_[0]
+    
+    return True
 
 def test_feature_selector(X, y):
     """Тест CombinedFeatureSelector."""

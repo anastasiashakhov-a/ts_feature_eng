@@ -28,7 +28,7 @@ from .selection import (
     SHAPFeatureSelector,
     CombinedFeatureSelector,
 )
-from .optimization import FeatureEngineeringOptimizer, FeatureEngineeringPipeline
+from .optimization import FeatureEngineeringOptimizer, FeatureEngineeringPipeline, OptimizerConfig
 
 # Утилиты для работы с временными рядами
 from .utils.validation import validate_time_series
@@ -67,6 +67,7 @@ __all__ = [
     "MetaFeatureExtractor",
     "FeatureEngineeringOptimizer",
     "FeatureEngineeringPipeline",
+    'OptimizerConfig',
     
     # Утилиты
     "validate_time_series",

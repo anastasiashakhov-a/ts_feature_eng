@@ -1,5 +1,6 @@
 # examples/energy_forecasting.py 
 
+# examples/energy_forecasting.py
 """
 Пример прогнозирования энергопотребления на данных из Марокко.
 
@@ -16,10 +17,11 @@
 6. Сравнение с базовыми моделями и интерпретация результатов
 7. Гибридная инженерия признаков (обязательные лаги + адаптивные преобразования)
 
-Оптимизировано для скорости:
-- Убрано прогнозирование на 24 часа (экономия ~50 минут)
-- Уменьшено количество итераций байесовской оптимизации
-- Отключена SHAP-фильтрация для скорости
+Использует улучшенный оптимизатор v2.0:
+- Out-of-sample penalties для честной оценки
+- Semantic entropy для разнообразия признаков
+- Relative score vs naive для переносимости между задачами
+- Диагностика collapse и dominance
 """
 
 import os
@@ -36,9 +38,14 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
-from ts_feature_eng import AutoFeatureEngineer
+from ts_feature_eng import AutoFeatureEngineer, OptimizerConfig  
 from ts_feature_eng.transformers.time_encoding import CalendarFeaturesTransformer
 from ts_feature_eng.transformers.lag import LagTransformer
+from ts_feature_eng.utils.metrics import (  
+    relative_score,
+    regime_robustness,
+    naive_gain
+)
 
 
 # ============================================================================
@@ -46,17 +53,50 @@ from ts_feature_eng.transformers.lag import LagTransformer
 # ============================================================================
 EXPERIMENT_CONFIG = {
     "sample_ratio": 1.0,          # Доля данных (1.0 = 100%)
-    "n_calls": 5,                 # Итерации байесовской оптимизации (было 20)
-    "n_initial_points": 3,        # Начальные точки оптимизации (было 5)
+    "n_calls": 10,                # Итерации байесовской оптимизации
+    "n_initial_points": 3,        # Начальные точки оптимизации
     "selection_threshold": 0.25,  # Порог отбора признаков
     "variance_threshold": 0.01,   # Порог дисперсии
     "shap_selection": True,      
-    "n_estimators": 100,          # Деревья в модели (было 200)
-    "max_depth": 4,               # Глубина деревьев (было 6)
+    "n_estimators": 100,          # Деревья в модели
+    "max_depth": 4,               # Глубина деревьев
     "learning_rate": 0.1,         # Скорость обучения
     "random_state": 42,           # Сид для воспроизводимости
     "train_test_split": 0.8,      # Доля обучающей выборки
 }
+
+# ============================================================================
+# КОНФИГУРАЦИЯ ОПТИМИЗАТОРА (INDUCTIVE BIASES)
+# ============================================================================
+OPTIMIZER_CONFIG = OptimizerConfig(
+    # Штрафы за тривиальные решения
+    dominance_lambda=0.5,          # Штраф если один признак >70% важности
+    naive_lambda=0.3,              # Штраф если прогноз ≈ lag_1
+    collapse_lambda=0.4,           # Штраф за feature collapse
+    
+    # Пороги
+    dominance_threshold=0.7,       # Макс. доля важности одного признака
+    naive_corr_threshold=0.95,     # Макс. корреляция с lag_1
+    
+    # Масштабирование и OOF
+    scale_penalties=True,          # Приводить штрафы к масштабу MAE
+    use_oof_penalties=True,        # Считать штрафы на OOF predictions
+    
+    # Разнообразие признаков
+    entropy_lambda=0.1,            # Бонус за семантическое разнообразие
+    
+    # Диагностика
+    log_diagnostics=True,          # Логировать диагностические метрики
+    diagnostics_file="results/optimization_diagnostics.csv",
+    
+    # Горизонты (для horizon-aware scoring)
+    use_horizon_aware=False,       # Включить gain(h) метрику (медленнее)
+    forecast_horizons=[1, 7],      # Горизонты для оценки
+    
+    # Search space
+    use_conditional_space=True,    # Активные параметры только если группа включена
+    use_progressive_modes=False,   # Запускать BO в фазах (baseline→structure→full)
+)
 
 
 def get_experiment_id(config):
@@ -68,21 +108,8 @@ def get_experiment_id(config):
 def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
     """
     Сохраняет метрики и параметры эксперимента в CSV файлы.
-    
-    Параметры
-    ----------
-    metrics : dict
-        Метрики качества модели.
-    config : dict
-        Параметры эксперимента.
-    experiment_id : str
-        Уникальный ID эксперимента.
-    results_dir : str
-        Директория для сохранения результатов.
     """
-    # Создаем директорию для результатов
     os.makedirs(results_dir, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     
     # 1. Сохраняем метрики
@@ -96,21 +123,22 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
         "r2": metrics.get("R²", np.nan),
         "error_from_peak_pct": metrics.get("Ошибка от пика (%)", np.nan),
         "peak_consumption_mw": metrics.get("Пик потребления (МВт)", np.nan),
+        "relative_score": metrics.get("Relative Score vs Naive", np.nan),  
+        "naive_gain": metrics.get("Naive Gain", np.nan),                    
         "n_features": metrics.get("n_features", 0),
         "n_train_samples": metrics.get("n_train_samples", 0),
         "n_test_samples": metrics.get("n_test_samples", 0),
+        # Диагностика оптимизатора
+        "max_feature_share": metrics.get("max_feature_share", np.nan),
+        "naive_corr": metrics.get("naive_corr", np.nan),
+        "semantic_entropy": metrics.get("semantic_entropy", np.nan),
     }
     
-    # Проверяем, существует ли файл
     file_exists = os.path.exists(metrics_file)
-    
     with open(metrics_file, "a", encoding="utf-8") as f:
         if not file_exists:
-            # Записываем заголовок
             header = ",".join(metrics_record.keys()) + "\n"
             f.write(header)
-        
-        # Записываем данные
         values = [str(v) for v in metrics_record.values()]
         f.write(",".join(values) + "\n")
     
@@ -123,23 +151,26 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
     }
     
     file_exists = os.path.exists(params_file)
-    
     with open(params_file, "a", encoding="utf-8") as f:
         if not file_exists:
-            # Записываем заголовок
             header = ",".join(params_record.keys()) + "\n"
             f.write(header)
-        
-        # Записываем данные
         values = [str(v) for v in params_record.values()]
         f.write(",".join(values) + "\n")
     
-    # 3. Сохраняем полный отчёт в JSON (для детального анализа)
+    # 3. Сохраняем полный отчёт в JSON
     report_file = os.path.join(results_dir, f"experiment_{experiment_id}_{timestamp}.json")
     full_report = {
         "timestamp": timestamp,
         "experiment_id": experiment_id,
         "config": config,
+        "optimizer_config": {
+            "dominance_lambda": OPTIMIZER_CONFIG.dominance_lambda,
+            "naive_lambda": OPTIMIZER_CONFIG.naive_lambda,
+            "entropy_lambda": OPTIMIZER_CONFIG.entropy_lambda,
+            "scale_penalties": OPTIMIZER_CONFIG.scale_penalties,
+            "use_oof_penalties": OPTIMIZER_CONFIG.use_oof_penalties,
+        },
         "metrics": metrics,
     }
     
@@ -153,34 +184,18 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
 
 
 def load_morocco_energy_data(data_path=None):
-    """
-    Загружает данные энергопотребления Марокко.
-    
-    Параметры
-    ----------
-    data_path : str, опционально
-        Путь к CSV файлу. Если не указан, ищет в стандартных местах.
-    
-    Возвращает
-    ----------
-    df : pd.DataFrame
-        DataFrame с колонками 'timestamp' и 'power_consumption'.
-    """
-    # Определяем путь к данным
+    """Загружает данные энергопотребления Марокко."""
     if data_path is None:
-        # Ищем в нескольких возможных местах
         possible_paths = [
             "data/morocco zone 1 - powerconsumption_resampled (1).csv",
             "data/morocco_zone_1_powerconsumption_resampled.csv",
             "../data/morocco zone 1 - powerconsumption_resampled (1).csv",
             os.path.expanduser("~/ts_feature_eng/data/morocco zone 1 - powerconsumption_resampled (1).csv")
         ]
-        
         for path in possible_paths:
             if os.path.exists(path):
                 data_path = path
                 break
-        
         if data_path is None:
             raise FileNotFoundError(
                 "Файл данных не найден. Укажите путь явно через параметр data_path.\n"
@@ -189,53 +204,38 @@ def load_morocco_energy_data(data_path=None):
     
     print(f"Загрузка данных из: {data_path}")
     
-    # Загрузка данных
     try:
         df = pd.read_csv(data_path)
     except Exception as e:
         raise RuntimeError(f"Ошибка при загрузке файла: {e}")
     
-    # Очистка имен столбцов от лишних пробелов
     df.columns = df.columns.str.strip()
     
-    # Определение столбцов с временными метками и потреблением
-    # Ищем столбцы, содержащие 'time', 'date', 'timestamp', 'dt'
     time_cols = [col for col in df.columns if any(kw in col.lower() for kw in ['time', 'date', 'timestamp', 'dt'])]
-    
     if not time_cols:
         raise ValueError("Не найден столбец с временными метками в данных")
-    
     time_col = time_cols[0]
     print(f"  Найден столбец временных меток: '{time_col}'")
     
-    # Ищем столбцы с потреблением (содержащие 'power', 'consum', 'load', 'energy')
     power_cols = [col for col in df.columns if any(kw in col.lower() for kw in ['power', 'consum', 'load', 'energy'])]
-    
     if not power_cols:
         raise ValueError("Не найден столбец с данными энергопотребления")
-    
     power_col = power_cols[0]
     print(f"  Найден столбец потребления: '{power_col}'")
     
-    # Преобразование временных меток
     try:
         df[time_col] = pd.to_datetime(df[time_col])
     except Exception as e:
         raise ValueError(f"Ошибка преобразования временных меток: {e}")
     
-    # Создание итогового DataFrame
     result = pd.DataFrame({
         "timestamp": df[time_col],
         "power_consumption": df[power_col]
     })
     
-    # Сортировка по времени и удаление дубликатов
     result = result.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
-    
-    # Установка временного индекса
     result = result.set_index("timestamp")
     
-    # Удаление пропусков в потреблении
     initial_len = len(result)
     result = result.dropna(subset=["power_consumption"])
     final_len = len(result)
@@ -248,29 +248,10 @@ def load_morocco_energy_data(data_path=None):
 
 
 def detect_ramadan_periods(df, years=None):
-    """
-    Определяет периоды Рамадана для указанных лет.
-    
-    Примечание: В реальном применении следует использовать точные даты Рамадана
-    из исламского календаря. Здесь приведена упрощенная демонстрация.
-    
-    Параметры
-    ----------
-    df : pd.DataFrame
-        Данные с временным индексом.
-    years : list, опционально
-        Список лет для анализа. Если не указан — все годы в данных.
-    
-    Возвращает
-    ----------
-    ramadan_mask : pd.Series
-        Булев маска, где True соответствует периодам Рамадана.
-    """
+    """Определяет периоды Рамадана для указанных лет (демонстрационная реализация)."""
     if years is None:
         years = sorted(df.index.year.unique())
     
-    # Упрощенная демонстрация: Рамадан обычно приходится на март-апрель-май
-    # В реальном применении замените на точные даты из исламского календаря
     ramadan_approx_dates = {
         2018: ("2018-05-16", "2018-06-14"),
         2019: ("2019-05-05", "2019-06-04"),
@@ -295,36 +276,17 @@ def detect_ramadan_periods(df, years=None):
 
 
 def create_ramadan_features(df):
-    """
-    Создает признаки, связанные с Рамаданом.
-    
-    Примечание: Это демонстрационная реализация. Для промышленного применения
-    требуется точный календарь исламских праздников.
-    
-    Параметры
-    ----------
-    df : pd.DataFrame
-        Исходные данные с временным индексом.
-    
-    Возвращает
-    ----------
-    df_features : pd.DataFrame
-        DataFrame с дополнительными признаками Рамадана.
-    """
+    """Создает признаки, связанные с Рамаданом (демонстрационная реализация)."""
     print("\nСоздание признаков Рамадана (демонстрационная реализация)...")
     
-    # Определение периодов Рамадана
     ramadan_mask = detect_ramadan_periods(df)
     
-    # Базовый признак: находится ли наблюдение в периоде Рамадана
     df_ramadan = pd.DataFrame(index=df.index)
     df_ramadan["is_ramadan"] = ramadan_mask.astype(int)
     
-    # Признаки до/после Рамадана (для учета подготовки и празднования)
     df_ramadan["days_until_ramadan"] = np.nan
     df_ramadan["days_since_ramadan"] = np.nan
     
-    # Расчет дней до/после для каждого наблюдения
     ramadan_days = df_ramadan[df_ramadan["is_ramadan"] == 1].index
     if len(ramadan_days) > 0:
         for idx in df_ramadan.index:
@@ -332,19 +294,16 @@ def create_ramadan_features(df):
                 df_ramadan.loc[idx, "days_until_ramadan"] = 0
                 df_ramadan.loc[idx, "days_since_ramadan"] = 0
             else:
-                # Дни до ближайшего Рамадана
                 future_ramadan = ramadan_days[ramadan_days > idx]
                 if len(future_ramadan) > 0:
                     days_until = (future_ramadan[0] - idx).days
-                    df_ramadan.loc[idx, "days_until_ramadan"] = min(days_until, 30)  # Ограничиваем 30 днями
+                    df_ramadan.loc[idx, "days_until_ramadan"] = min(days_until, 30)
                 
-                # Дни после последнего Рамадана
                 past_ramadan = ramadan_days[ramadan_days < idx]
                 if len(past_ramadan) > 0:
                     days_since = (idx - past_ramadan[-1]).days
                     df_ramadan.loc[idx, "days_since_ramadan"] = min(days_since, 30)
     
-    # Заполняем пропуски
     df_ramadan["days_until_ramadan"] = df_ramadan["days_until_ramadan"].fillna(30)
     df_ramadan["days_since_ramadan"] = df_ramadan["days_since_ramadan"].fillna(30)
     
@@ -355,29 +314,19 @@ def create_ramadan_features(df):
 
 
 def plot_consumption_patterns(df, title="Паттерны энергопотребления"):
-    """
-    Визуализирует ключевые паттерны энергопотребления.
-    
-    Параметры
-    ----------
-    df : pd.DataFrame
-        Данные с колонкой 'power_consumption'.
-    title : str
-        Заголовок графика.
-    """
+    """Визуализирует ключевые паттерны энергопотребления."""
     print(f"\nВизуализация паттернов потребления: {title}")
     
-    # Создаем подграфики
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
     
-    # 1. Общий тренд потребления
+    # 1. Общий тренд
     ax = axes[0, 0]
     df["power_consumption"].plot(ax=ax, color='blue', linewidth=1, alpha=0.7)
     ax.set_title("Общий тренд энергопотребления", fontsize=12, fontweight='bold')
     ax.set_ylabel("Потребление (МВт)", fontsize=10)
     ax.grid(True, alpha=0.3)
     
-    # 2. Суточной паттерн (усредненный по всем дням)
+    # 2. Суточной паттерн
     ax = axes[0, 1]
     hourly_avg = df.groupby(df.index.hour)["power_consumption"].mean()
     hourly_std = df.groupby(df.index.hour)["power_consumption"].std()
@@ -405,7 +354,7 @@ def plot_consumption_patterns(df, title="Паттерны энергопотре
     ax.set_ylabel("Среднее потребление (МВт)", fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 4. Сезонный паттерн (по месяцам)
+    # 4. Сезонный паттерн
     ax = axes[1, 1]
     monthly_avg = df.groupby(df.index.month)["power_consumption"].mean()
     month_labels = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек']
@@ -414,7 +363,7 @@ def plot_consumption_patterns(df, title="Паттерны энергопотре
     ax.set_ylabel("Среднее потребление (МВт)", fontsize=10)
     ax.grid(True, alpha=0.3)
     
-    # 5. Распределение потребления
+    # 5. Распределение
     ax = axes[2, 0]
     sns.histplot(df["power_consumption"], bins=50, kde=True, ax=ax, color='purple')
     ax.axvline(df["power_consumption"].mean(), color='red', linestyle='--', label=f'Среднее: {df["power_consumption"].mean():.0f} МВт')
@@ -428,7 +377,7 @@ def plot_consumption_patterns(df, title="Паттерны энергопотре
     # 6. Автокорреляция
     ax = axes[2, 1]
     from statsmodels.graphics.tsaplots import plot_acf
-    plot_acf(df["power_consumption"].dropna(), lags=168, ax=ax, alpha=0.05)  # 168 часов = 1 неделя
+    plot_acf(df["power_consumption"].dropna(), lags=168, ax=ax, alpha=0.05)
     ax.set_title("Автокорреляция потребления (до 168 лагов)", fontsize=12, fontweight='bold')
     ax.set_xlabel("Лаг (часы)", fontsize=10)
     ax.set_ylabel("ACF", fontsize=10)
@@ -441,9 +390,9 @@ def plot_consumption_patterns(df, title="Паттерны энергопотре
     plt.close()
 
 
-def evaluate_forecast(y_true, y_pred, horizon_hours=1):
+def evaluate_forecast(y_true, y_pred, horizon_hours=1, y_lag1=None):
     """
-    Оценивает качество прогноза с интерпретацией для энергосистемы.
+    Оценивает качество прогноза с расширенными метриками.
     
     Параметры
     ----------
@@ -453,6 +402,8 @@ def evaluate_forecast(y_true, y_pred, horizon_hours=1):
         Предсказанные значения.
     horizon_hours : int
         Горизонт прогнозирования в часах.
+    y_lag1 : array-like, опционально
+        Значения lag_1 для расчёта relative score и gain.
     
     Возвращает
     ----------
@@ -471,9 +422,9 @@ def evaluate_forecast(y_true, y_pred, horizon_hours=1):
     else:
         mape = np.nan
     
-    # Средняя ошибка в процентах от пикового потребления
+    # Ошибка от пика
     peak_consumption = np.max(y_true)
-    mean_abs_error_pct = (mae / peak_consumption) * 100
+    mean_abs_error_pct = (mae / peak_consumption) * 100 if peak_consumption > 0 else np.nan
     
     metrics = {
         "MAE (МВт)": mae,
@@ -484,19 +435,46 @@ def evaluate_forecast(y_true, y_pred, horizon_hours=1):
         "Пик потребления (МВт)": peak_consumption
     }
     
-    # Интерпретация для энергосистемы
-    print(f"\nОценка качества прогноза (горизонт: {horizon_hours} час{'а' if horizon_hours in [2,3,4] else 'ов'}):")
-    print("-" * 65)
-    print(f"{'Метрика':<25} {'Значение':<15} {'Интерпретация'}")
-    print("-" * 65)
-    print(f"{'MAE':<25} {mae:>10.2f} МВт  {'Средняя ошибка прогноза'}")
-    print(f"{'RMSE':<25} {rmse:>10.2f} МВт  {'Чувствительность к крупным ошибкам'}")
-    print(f"{'MAPE':<25} {mape:>10.2f} %    {'Относительная ошибка'}")
-    print(f"{'R²':<25} {r2:>10.4f}       {'Доля объясненной дисперсии'}")
-    print(f"{'Ошибка от пика':<25} {mean_abs_error_pct:>10.2f} %    {'Критичность для балансировки'}")
-    print("-" * 65)
+    #  НОВЫЕ МЕТРИКИ: Relative Score и Naive Gain
+    if y_lag1 is not None:
+        naive_mae = mean_absolute_error(y_true, y_lag1)
+        metrics["Relative Score vs Naive"] = relative_score(mae, naive_mae)
+        metrics["Naive Gain"] = naive_gain(y_true, y_pred, y_lag1)
+        metrics["Naive MAE (МВт)"] = naive_mae
     
-    # Рекомендации по надежности прогноза
+    #  Regime Robustness (оценка на разных режимах)
+    try:
+        robustness = regime_robustness(y_true, y_pred)
+        metrics.update({
+            "MAE Calm": robustness.get('mae_calm', np.nan),
+            "MAE Volatile": robustness.get('mae_volatile', np.nan),
+            "Robustness Ratio": robustness.get('robustness_ratio', np.nan)
+        })
+    except:
+        pass
+    
+    # Интерпретация
+    print(f"\nОценка качества прогноза (горизонт: {horizon_hours} час{'а' if horizon_hours in [2,3,4] else 'ов'}):")
+    print("-" * 75)
+    print(f"{'Метрика':<30} {'Значение':<20} {'Интерпретация'}")
+    print("-" * 75)
+    print(f"{'MAE':<30} {mae:>10.2f} МВт     {'Средняя ошибка прогноза'}")
+    print(f"{'RMSE':<30} {rmse:>10.2f} МВт     {'Чувствительность к крупным ошибкам'}")
+    print(f"{'MAPE':<30} {mape:>10.2f} %       {'Относительная ошибка'}")
+    print(f"{'R²':<30} {r2:>10.4f}          {'Доля объясненной дисперсии'}")
+    print(f"{'Ошибка от пика':<30} {mean_abs_error_pct:>10.2f} %       {'Критичность для балансировки'}")
+    
+    if "Relative Score vs Naive" in metrics:
+        rel_score = metrics["Relative Score vs Naive"]
+        print(f"{'Relative Score vs Naive':<30} {rel_score:>10.4f}       {'<1.0 = лучше naive'}")
+    
+    if "Naive Gain" in metrics:
+        gain = metrics["Naive Gain"]
+        print(f"{'Naive Gain':<30} {gain:>10.2f} МВт     {'Улучшение относительно naive'}")
+    
+    print("-" * 75)
+    
+    # Рекомендации
     if mean_abs_error_pct < 2.0:
         reliability = "ОЧЕНЬ ВЫСОКАЯ"
         recommendation = "Подходит для автоматической балансировки"
@@ -518,13 +496,21 @@ def evaluate_forecast(y_true, y_pred, horizon_hours=1):
 
 def main():
     print("=" * 80)
-    print("ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ НА ДАННЫХ ИЗ МАРОККО (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)")
+    print("ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ (OPTIMIZER v2.0)")
     print("=" * 80)
     
-    # Генерируем ID эксперимента
     experiment_id = get_experiment_id(EXPERIMENT_CONFIG)
     print(f"ID эксперимента: {experiment_id}")
     print(f"Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    #  ЛОГИРОВАНИЕ КОНФИГУРАЦИИ ОПТИМИЗАТОРА
+    print(f"\nКонфигурация оптимизатора:")
+    print(f"  • dominance_lambda: {OPTIMIZER_CONFIG.dominance_lambda}")
+    print(f"  • naive_lambda: {OPTIMIZER_CONFIG.naive_lambda}")
+    print(f"  • entropy_lambda: {OPTIMIZER_CONFIG.entropy_lambda}")
+    print(f"  • scale_penalties: {OPTIMIZER_CONFIG.scale_penalties}")
+    print(f"  • use_oof_penalties: {OPTIMIZER_CONFIG.use_oof_penalties}")
+    print(f"  • diagnostics_file: {OPTIMIZER_CONFIG.diagnostics_file}")
     
     # Шаг 1: Загрузка данных
     print("\n1. Загрузка данных энергопотребления Марокко...")
@@ -532,12 +518,9 @@ def main():
         df = load_morocco_energy_data()
     except Exception as e:
         print(f"Ошибка при загрузке данных: {e}")
-        print("\nСовет: Убедитесь, что файл находится в одной из следующих директорий:")
-        print("  - data/morocco zone 1 - powerconsumption_resampled (1).csv")
-        print("  - ~/ts_feature_eng/data/...")
         return
     
-    # Шаг 2: Анализ структуры данных
+    # Шаг 2: Анализ структуры
     print("\n2. Анализ структуры временного ряда...")
     print(f"   Частота дискретизации: {pd.infer_freq(df.index)}")
     print(f"   Количество пропусков: {df['power_consumption'].isna().sum()}")
@@ -545,32 +528,34 @@ def main():
     print(f"   Максимальное потребление: {df['power_consumption'].max():.2f} МВт")
     print(f"   Среднее потребление: {df['power_consumption'].mean():.2f} МВт")
     
-    # Шаг 3: Визуализация паттернов потребления
+    # Шаг 3: Визуализация
     print("\n3. Визуализация ключевых паттернов потребления...")
     plot_consumption_patterns(df, title="Паттерны энергопотребления в Марокко (Зона 1)")
     
-    # Шаг 4: Подготовка данных для прогнозирования
+    # Шаг 4: Подготовка данных
     print("\n4. Подготовка данных для задачи прогнозирования...")
     
-    # Создаем признаки Рамадана (демонстрационные)
     ramadan_features = create_ramadan_features(df)
     
-    # Объединяем с основными данными
     X = pd.DataFrame({"power_consumption": df["power_consumption"]})
     X = pd.concat([X, ramadan_features], axis=1)
     
-    # Целевая переменная: прогноз на 1 час вперед
     y = df["power_consumption"].shift(-1)
     
-    # Удаляем последние наблюдения с пропусками
     valid_mask = ~y.isna()
     X = X[valid_mask]
     y = y[valid_mask]
     
+    # Сохраняем lag_1 для расчёта relative metrics
+    lag1_col = [c for c in X.columns if "lag_1" in c]
+    y_lag1 = None
+    if lag1_col and lag1_col[0] in X.columns:
+        y_lag1 = X[lag1_col[0]].values
+    
     print(f"   Размер признакового пространства до инженерии: {X.shape[1]} признаков")
     print(f"   Количество наблюдений для обучения: {len(X)}")
     
-    # Шаг 5: Разделение на обучающую и тестовую выборки (временное разделение)
+    # Шаг 5: Разделение
     print("\n5. Разделение данных с сохранением временного порядка...")
     split_idx = int(len(X) * EXPERIMENT_CONFIG["train_test_split"])
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
@@ -579,9 +564,9 @@ def main():
     print(f"   Обучающая выборка: {len(X_train)} наблюдений ({X_train.index.min()} — {X_train.index.max()})")
     print(f"   Тестовая выборка: {len(X_test)} наблюдений ({X_test.index.min()} — {X_test.index.max()})")
     
-    # Шаг 6: Автоматическая инженерия признаков с гибридным подходом
-    print("\n6. Автоматическая инженерия признаков с гибридным подходом...")
-    print("   Режим: core pipeline (обязательные лаги) + auto pipeline (адаптивные преобразования)")
+    # Шаг 6: Автоматическая инженерия признаков С НОВОЙ КОНФИГУРАЦИЕЙ
+    print("\n6. Автоматическая инженерия признаков (Optimizer v2.0)...")
+    print("   Режим: core pipeline + auto pipeline + inductive biases")
     
     engineer = AutoFeatureEngineer(
         optimize=True,
@@ -592,28 +577,27 @@ def main():
         variance_threshold=EXPERIMENT_CONFIG["variance_threshold"],
         shap_selection=EXPERIMENT_CONFIG["shap_selection"],
         random_state=EXPERIMENT_CONFIG["random_state"],
-        verbose=1
+        verbose=1,
+        optimizer_config=OPTIMIZER_CONFIG  
     )
     
-    # Обучение инженера
     X_train_transformed = engineer.fit_transform(X_train, y_train)
     
     print(f"\n   Сгенерировано признаков: {X_train_transformed.shape[1]}")
     print(f"   Примеры ключевых признаков:")
     
-    # Группируем признаки по типу для лучшей интерпретации
     feature_groups = {
         "Core (лаги)": [col for col in X_train_transformed.columns if "lag_" in col][:3],
         "Оконные (тренд/волатильность)": [col for col in X_train_transformed.columns if "window" in col and "lag_" not in col][:3],
         "Спектральные (сезонность)": [col for col in X_train_transformed.columns if "stl" in col or "dwt" in col][:3],
         "Временные (цикличность)": [col for col in X_train_transformed.columns if "time." in col][:3],
-        "Календарные (Рамадан/будни)": [col for col in X_train_transformed.columns if "calendar" in col or "ramadan" in col.lower()][:3]
+        "Календарные": [col for col in X_train_transformed.columns if "calendar" in col or "ramadan" in col.lower()][:3]
     }
     
     for group_name, features in feature_groups.items():
         if features:
             print(f"\n   {group_name}:")
-            for feat in features[:2]:  # Показываем только первые 2 из каждой группы
+            for feat in features[:2]:
                 print(f"      • {feat}")
     
     # Шаг 7: Применение к тестовым данным
@@ -621,8 +605,8 @@ def main():
     X_test_transformed = engineer.transform(X_test)
     print(f"   Размер трансформированных тестовых данных: {X_test_transformed.shape}")
     
-    # Шаг 8: Обучение модели прогнозирования
-    print("\n8. Обучение модели градиентного бустинга на сгенерированных признаках...")
+    # Шаг 8: Обучение модели
+    print("\n8. Обучение модели градиентного бустинга...")
     model = GradientBoostingRegressor(
         n_estimators=EXPERIMENT_CONFIG["n_estimators"],
         max_depth=EXPERIMENT_CONFIG["max_depth"],
@@ -630,18 +614,39 @@ def main():
         random_state=EXPERIMENT_CONFIG["random_state"]
     )
     
-    # Заполняем оставшиеся пропуски нулями (для начальных наблюдений оконных признаков)
     model.fit(X_train_transformed.fillna(0), y_train)
     
-    # Прогнозирование
     y_pred_train = model.predict(X_train_transformed.fillna(0))
     y_pred_test = model.predict(X_test_transformed.fillna(0))
     
-    # Шаг 9: Оценка качества прогноза
+    # Шаг 9: Оценка качества с расширенными метриками
     print("\n9. Оценка качества прогноза на тестовой выборке...")
-    test_metrics = evaluate_forecast(y_test, y_pred_test, horizon_hours=1)
     
-    # Добавляем дополнительную информацию в метрики
+    # Получаем lag_1 для тестовых данных
+    y_test_lag1 = None
+    if lag1_col and lag1_col[0] in X_test_transformed.columns:
+        y_test_lag1 = X_test_transformed[lag1_col[0]].values
+    
+    test_metrics = evaluate_forecast(
+        y_test, y_pred_test, 
+        horizon_hours=1,
+        y_lag1=y_test_lag1  # ← ПЕРЕДАЁМ LAG_1 ДЛЯ RELATIVE METRICS
+    )
+    
+    #  ДОБАВЛЯЕМ ДИАГНОСТИКУ ОПТИМИЗАТОРА В МЕТРИКИ
+    history = engineer.get_optimization_history()
+    if history is not None and not history.empty:
+        last_trial = history.iloc[-1]
+        test_metrics.update({
+            "max_feature_share": last_trial.get('max_feature_share', np.nan),
+            "naive_corr": last_trial.get('naive_corr', np.nan),
+            "semantic_entropy": last_trial.get('entropy_bonus', np.nan) / OPTIMIZER_CONFIG.entropy_lambda if OPTIMIZER_CONFIG.entropy_lambda > 0 else np.nan,
+        })
+        print(f"\n    Диагностика последнего trial:")
+        print(f"      • Max feature share: {test_metrics['max_feature_share']:.2%}")
+        print(f"      • Naive correlation: {test_metrics['naive_corr']:.3f}")
+        print(f"      • Semantic entropy: {test_metrics['semantic_entropy']:.3f}")
+    
     test_metrics["n_features"] = X_train_transformed.shape[1]
     test_metrics["n_train_samples"] = len(X_train)
     test_metrics["n_test_samples"] = len(X_test)
@@ -649,7 +654,6 @@ def main():
     # Шаг 10: Анализ важности признаков
     print("\n10. Анализ важности сгенерированных признаков...")
     
-    # Получаем важность признаков из модели
     feature_importance = pd.DataFrame({
         "feature": X_train_transformed.columns,
         "importance": model.feature_importances_
@@ -659,14 +663,13 @@ def main():
     print("   " + "-" * 70)
     for idx, row in feature_importance.head(10).iterrows():
         importance_pct = row["importance"] * 100
-        # Упрощаем имя признака для лучшей читаемости
         feature_name = row["feature"]
         if len(feature_name) > 50:
             feature_name = feature_name[:47] + "..."
         print(f"   {importance_pct:>6.2f}% | {feature_name}")
     print("   " + "-" * 70)
     
-    # Анализ по группам признаков
+    # Анализ по группам
     print("\n   Важность по группам признаков:")
     groups = {
         "Core (лаги)": ["lag_"],
@@ -683,33 +686,26 @@ def main():
             mask |= feature_importance["feature"].str.contains(kw, case=False)
         group_importance[group_name] = feature_importance.loc[mask, "importance"].sum() * 100
     
-    # Сортируем по важности
     for group_name, importance in sorted(group_importance.items(), key=lambda x: x[1], reverse=True):
         bar = "█" * int(importance / 2)
         print(f"   {group_name:25s} | {importance:5.1f}% {bar}")
-  
     
-    # Шаг 11: Сравнение с базовыми моделями (теперь шаг 11)
+    # Шаг 11: Сравнение с базовыми моделями
     print("\n11. Сравнение с базовыми подходами...")
     
-    # Базовая модель 1: Наивный прогноз (последнее наблюдение)
     naive_pred = y_test.shift(1).fillna(y_test.mean())
     naive_mae = mean_absolute_error(y_test, naive_pred)
     
-    # Базовая модель 2: Сезонный наивный (значение 24 часа назад)
     seasonal_naive_pred = y_test.shift(24).fillna(y_test.mean())
     seasonal_naive_mae = mean_absolute_error(y_test, seasonal_naive_pred)
     
-    # Базовая модель 3: Случайный лес на исходных признаках
     rf_base = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=EXPERIMENT_CONFIG["random_state"])
     rf_base.fit(X_train.fillna(0), y_train)
     rf_base_pred = rf_base.predict(X_test.fillna(0))
     rf_base_mae = mean_absolute_error(y_test, rf_base_pred)
     
-    # Наша модель
     auto_mae = test_metrics["MAE (МВт)"]
     
-    # Вывод сравнения
     print("\n   Сравнение моделей по MAE (меньше — лучше):")
     print("   " + "-" * 60)
     models_comparison = [
@@ -725,19 +721,16 @@ def main():
         star = " ← ЛУЧШАЯ" if mae_value == best_mae else ""
         improvement = ((naive_mae - mae_value) / naive_mae) * 100
         print(f"   {model_name:35s} | {mae_value:6.2f} МВт | улучшение: {improvement:5.1f}%{star}")
-    
     print("   " + "-" * 60)
     
-    # Шаг 12: Визуализация прогноза (теперь шаг 12)
+    # Шаг 12: Визуализация прогноза
     print("\n12. Визуализация прогноза на тестовом периоде...")
     
-    # Выбираем период для визуализации (последние 200 наблюдений тестовой выборки)
     viz_end = len(y_test)
     viz_start = max(0, viz_end - 200)
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
     
-    # Верхний график: фактическое потребление и прогноз
     ax1.plot(
         y_test.index[viz_start:viz_end],
         y_test.iloc[viz_start:viz_end],
@@ -769,7 +762,6 @@ def main():
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
     
-    # Нижний график: ошибка прогноза
     error = y_test.iloc[viz_start:viz_end] - y_pred_test[viz_start:viz_end]
     ax2.plot(
         y_test.index[viz_start:viz_end],
@@ -808,7 +800,7 @@ def main():
     print("   График сохранен как 'energy_forecast_comparison.png'")
     plt.close()
     
-    # Шаг 13: Сохранение результатов в CSV (теперь шаг 13)
+    # Шаг 13: Сохранение результатов
     print("\n13. Сохранение результатов эксперимента...")
     metrics_file, params_file, report_file = save_results_to_csv(
         metrics=test_metrics,
@@ -816,21 +808,34 @@ def main():
         experiment_id=experiment_id,
         results_dir="results"
     )
-
+    
+    #  ВЫВОД ДИАГНОСТИКИ ОПТИМИЗАТОРА
+    if OPTIMIZER_CONFIG.log_diagnostics and OPTIMIZER_CONFIG.diagnostics_file:
+        print(f"\n    Диагностика оптимизатора сохранена в: {OPTIMIZER_CONFIG.diagnostics_file}")
+        if os.path.exists(OPTIMIZER_CONFIG.diagnostics_file):
+            diag_df = pd.read_csv(OPTIMIZER_CONFIG.diagnostics_file)
+            if not diag_df.empty:
+                print(f"      • Записей в логе: {len(diag_df)}")
+                print(f"      • Средняя max_feature_share: {diag_df['max_feature_share'].mean():.2%}")
+                print(f"      • Средняя naive_corr: {diag_df['naive_corr'].mean():.3f}")
+    
     print("\n" + "=" * 80)
     print("ПРИМЕР ЗАВЕРШЕН")
     print("=" * 80)
     print("\nСгенерированные файлы:")
     print("  • energy_consumption_patterns.png : анализ паттернов потребления")
     print("  • energy_forecast_comparison.png  : сравнение прогноза с фактом")
-    print("  • results/metrics_history.csv     : история метрик")
+    print("  • results/metrics_history.csv     : история метрик (с relative score)")
     print("  • results/experiments_config.csv  : история конфигураций")
-    print(f"  • Автоматическая инженерия признаков улучшила прогноз на {((naive_mae - auto_mae) / naive_mae * 100):.1f}%")
-
+    print(f"  • results/optimization_diagnostics.csv : диагностика оптимизатора")
+    
+    if "Relative Score vs Naive" in test_metrics:
+        rel = test_metrics["Relative Score vs Naive"]
+        status = " ЛУЧШЕ NAIVE" if rel < 1.0 else "⚠ ХУЖЕ NAIVE"
+        print(f"\n  • Relative Score vs Naive: {rel:.4f} {status}")
 
 
 if __name__ == "__main__":
-    # Проверка наличия matplotlib и seaborn для визуализации
     try:
         import matplotlib  # noqa: F401
         import seaborn  # noqa: F401

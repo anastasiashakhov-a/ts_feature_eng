@@ -1,5 +1,7 @@
 # src/ts_feature_eng/utils/metrics.py 
 
+# src/ts_feature_eng/utils/metrics.py
+
 """
 Метрики оценки качества прогнозирования временных рядов и признакового пространства.
 
@@ -8,9 +10,13 @@
 - Взвешенные версии метрик (акцент на свежие наблюдения)
 - Метрики для оценки качества самих признаков
 - Полная совместимость с интерфейсом scikit-learn
+- Новые метрики для multi-objective оптимизации:
+  * relative_score - отношение MAE модели к MAE наивного прогноза
+  * naive_gain - улучшение относительно наивного прогноза
+  * regime_robustness - устойчивость на разных режимах
 """
 
-from typing import Callable, Optional, Union
+from typing import Callable, Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -276,6 +282,151 @@ def mase(
         naive_mae = 1e-8
     
     return float(model_mae / naive_mae)
+
+
+def relative_score(
+    model_mae: float,
+    naive_mae: float,
+    epsilon: float = 1e-8
+) -> float:
+    """
+    Вычисление относительного score: MAE_model / MAE_naive.
+    
+    Значения < 1.0 означают улучшение относительно naive.
+    В отличие от MASE, не требует обучающего набора и работает только с тестовыми данными.
+    
+    Параметры
+    ----------
+    model_mae : float
+        MAE модели.
+    naive_mae : float
+        MAE наивного прогноза.
+    epsilon : float, по умолчанию 1e-8
+        Малая константа для защиты от деления на ноль.
+    
+    Возвращает
+    ----------
+    relative_score : float
+        Относительный score (MAE_model / MAE_naive).
+    
+    Примеры
+    --------
+    >>> relative_score(10.0, 15.0)
+    0.666...
+    >>> relative_score(20.0, 15.0)
+    1.333...
+    """
+    if naive_mae < epsilon:
+        return model_mae  # Защита от деления на ноль
+    return model_mae / naive_mae
+
+
+def naive_gain(
+    y_true: Union[np.ndarray, pd.Series],
+    y_pred: Union[np.ndarray, pd.Series],
+    y_lag1: Union[np.ndarray, pd.Series]
+) -> float:
+    """
+    Вычисление gain(h) = MAE_naive(h) - MAE_model(h).
+    
+    Положительный gain означает, что модель лучше naive на горизонте h.
+    
+    Параметры
+    ----------
+    y_true : np.ndarray или pd.Series
+        Фактические значения.
+    y_pred : np.ndarray или pd.Series
+        Предсказанные значения модели.
+    y_lag1 : np.ndarray или pd.Series
+        Предсказанные значения наивного прогноза (lag_1).
+    
+    Возвращает
+    ----------
+    gain : float
+        Улучшение относительно наивного прогноза.
+    
+    Примеры
+    --------
+    >>> y_true = [10, 12, 14, 16]
+    >>> y_pred = [10.5, 12.2, 13.8, 16.1]
+    >>> y_lag1 = [9.5, 10.5, 12.5, 14.5]
+    >>> naive_gain(y_true, y_pred, y_lag1)
+    0.95
+    """
+    model_mae = mean_absolute_error(y_true, y_pred)
+    naive_mae = mean_absolute_error(y_true, y_lag1)
+    return naive_mae - model_mae
+
+
+def regime_robustness(
+    y_true: Union[np.ndarray, pd.Series],
+    y_pred: Union[np.ndarray, pd.Series],
+    volatility_threshold: float = 0.5
+) -> Dict[str, float]:
+    """
+    Оценка устойчивости модели на разных режимах.
+    
+    Параметры
+    ----------
+    y_true : np.ndarray или pd.Series
+        Фактические значения.
+    y_pred : np.ndarray или pd.Series
+        Предсказанные значения.
+    volatility_threshold : float, по умолчанию 0.5
+        Порог для определения волатильных периодов (процентиль).
+    
+    Возвращает
+    ----------
+    robustness : Dict[str, float]
+        Словарь с метриками устойчивости:
+        - 'mae_calm': MAE на спокойных периодах
+        - 'mae_volatile': MAE на волатильных периодах
+        - 'robustness_ratio': отношение MAE_volatile / MAE_calm
+    
+    Примеры
+    --------
+    >>> y_true = np.array([10, 12, 14, 16, 100, 120, 140, 160])
+    >>> y_pred = np.array([10.5, 12.2, 13.8, 16.1, 95, 125, 135, 165])
+    >>> regime_robustness(y_true, y_pred)
+    {'mae_calm': 0.275, 'mae_volatile': 5.0, 'robustness_ratio': 18.18...}
+    """
+    y_true, y_pred, _ = _validate_inputs(y_true, y_pred, None)
+    
+    # Вычисляем волатильность (абсолютные изменения)
+    volatility = np.abs(np.diff(y_true))
+    if len(volatility) == 0:
+        return {
+            'mae_calm': float('nan'),
+            'mae_volatile': float('nan'),
+            'robustness_ratio': float('nan')
+        }
+    
+    # Определяем порог волатильности
+    threshold = np.percentile(volatility, 100 - volatility_threshold * 100)
+    
+    # Создаем маску для волатильных периодов (начиная со второго наблюдения)
+    high_vol_mask = np.zeros(len(y_true), dtype=bool)
+    high_vol_mask[1:] = volatility > threshold
+    
+    # Вычисляем MAE на разных режимах
+    if np.any(~high_vol_mask):
+        mae_calm = mean_absolute_error(y_true[~high_vol_mask], y_pred[~high_vol_mask])
+    else:
+        mae_calm = float('nan')
+    
+    if np.any(high_vol_mask):
+        mae_volatile = mean_absolute_error(y_true[high_vol_mask], y_pred[high_vol_mask])
+    else:
+        mae_volatile = float('nan')
+    
+    # Вычисляем отношение
+    robustness_ratio = mae_volatile / mae_calm if mae_calm > 0 else float('nan')
+    
+    return {
+        'mae_calm': mae_calm,
+        'mae_volatile': mae_volatile,
+        'robustness_ratio': robustness_ratio
+    }
 
 
 def r2(
@@ -553,6 +704,9 @@ def get_scorer(name: str, **kwargs) -> Callable:
         - "mase"
         - "r2"
         - "directional_accuracy"
+        - "relative_score"
+        - "naive_gain"
+        - "regime_robustness"
     **kwargs : dict
         Дополнительные параметры для метрики (например, `seasonality` для MASE).
     
@@ -579,6 +733,11 @@ def get_scorer(name: str, **kwargs) -> Callable:
         "mase": lambda y_true, y_pred: mase(y_true, y_pred, **kwargs),
         "r2": r2,
         "directional_accuracy": directional_accuracy,
+        "relative_score": lambda y_true, y_pred, y_lag1: relative_score(
+            mae(y_true, y_pred), mae(y_true, y_lag1)
+        ),
+        "naive_gain": lambda y_true, y_pred, y_lag1: naive_gain(y_true, y_pred, y_lag1),
+        "regime_robustness": lambda y_true, y_pred: regime_robustness(y_true, y_pred)
     }
     
     if name not in metric_map:
@@ -591,7 +750,7 @@ def get_scorer(name: str, **kwargs) -> Callable:
             )
     
     # Для метрик, где "больше = лучше" (например, R², directional_accuracy)
-    greater_is_better = name in ["r2", "directional_accuracy"]
+    greater_is_better = name in ["r2", "directional_accuracy", "naive_gain"]
     
     return make_scorer(metric_map[name], greater_is_better=greater_is_better)
 

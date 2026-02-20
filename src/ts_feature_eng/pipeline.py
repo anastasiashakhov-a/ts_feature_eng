@@ -1,5 +1,6 @@
 # src/ts_feature_eng/pipeline.py
 
+# src/ts_feature_eng/pipeline.py
 """
 Основной пайплайн автоматической инженерии признаков для временных рядов.
 Предоставляет единый интерфейс AutoFeatureEngineer для адаптивного подбора
@@ -8,11 +9,16 @@
 from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
-import pywt  as pywt
+import pywt  # ← Импортируем для DWT (без "as pywt")
 from sklearn.base import BaseEstimator, TransformerMixin
+
 from .base import TimeSeriesError
 from .meta_features import MetaFeatureExtractor
-from .optimization import FeatureEngineeringOptimizer, FeatureEngineeringPipeline
+from .optimization import (
+    FeatureEngineeringOptimizer, 
+    FeatureEngineeringPipeline,
+    OptimizerConfig  # ← НОВЫЙ ИМПОРТ
+)
 from .selection import CombinedFeatureSelector
 from .transformers.window import WindowTransformer
 from .transformers.lag import LagTransformer
@@ -66,6 +72,9 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         Фиксация случайного состояния для воспроизводимости.
     verbose : int, по умолчанию 0
         Уровень детализации логирования (0=минимум, 1=итерации оптимизации).
+    optimizer_config : OptimizerConfig, опционально
+        Конфигурация индуктивных смещений для оптимизатора.
+        Если не указана, используются значения по умолчанию.
     
     Атрибуты
     ----------
@@ -119,6 +128,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         shap_n_features: Optional[Union[int, float]] = None,
         random_state: Optional[int] = 42,
         verbose: int = 0,
+        optimizer_config: Optional[OptimizerConfig] = None,  # ← НОВЫЙ ПАРАМЕТР
     ):
         self.optimize = optimize
         self.use_meta_features = use_meta_features
@@ -133,6 +143,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         self.shap_n_features = shap_n_features
         self.random_state = random_state
         self.verbose = verbose
+        self.optimizer_config = optimizer_config  # ← СОХРАНЯЕМ КОНФИГУРАЦИЮ
         
         # Внутренние атрибуты
         self.best_pipeline_ = None
@@ -209,7 +220,8 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                     n_initial_points=self.n_initial_points,
                     random_state=self.random_state,
                     use_meta_features=self.use_meta_features,
-                    verbose=self.verbose >= 2
+                    verbose=self.verbose >= 2,
+                    config=self.optimizer_config  # ← ПЕРЕДАЁМ КОНФИГУРАЦИЮ
                 )
                 
                 # Запускаем оптимизацию только для auto-компонентов
@@ -221,6 +233,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 combined_transformers = core_pipeline.transformers + best_auto_pipeline.transformers
                 self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
 
+                # 🔑 ОБУЧАЕМ ПЛАЙПЛАЙН
                 self.best_pipeline_.fit(X, y)
                 
                 self.optimization_history_ = optimizer.get_search_history()
@@ -237,7 +250,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 default_pipeline = self._create_default_pipeline(X)
                 combined_transformers = core_pipeline.transformers + default_pipeline.transformers
                 self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
-                self.best_pipeline_.fit(X, y)
+                self.best_pipeline_.fit(X, y)  # 🔑 ОБУЧАЕМ ПЛАЙПЛАЙН
         
         else:
             # Используем фиксированный пайплайн по умолчанию
@@ -250,6 +263,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 combined_transformers = core_pipeline.transformers + default_pipeline.transformers
                 self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
                 
+                # 🔑 ОБУЧАЕМ ПЛАЙПЛАЙН
                 self.best_pipeline_.fit(X, y)
                 
                 if self.verbose >= 1:
@@ -260,7 +274,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                     print(f"Warning: Failed to create default pipeline: {e}. Using core pipeline only.")
                 # Используем только core pipeline
                 self.best_pipeline_ = core_pipeline
-                self.best_pipeline_.fit(X, y)
+                self.best_pipeline_.fit(X, y)  # 🔑 ОБУЧАЕМ ПЛАЙПЛАЙН
         
         # Шаг 4: Применение постфильтрации признаков
         if self.apply_selection:
@@ -326,6 +340,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 "AutoFeatureEngineer is not fitted. Call fit() before transform()."
             )
         
+        # 🔑 ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА
         if self.best_pipeline_ is None:
             raise TimeSeriesError(
                 "best_pipeline_ is None. The fit() method may have failed to create a pipeline."
@@ -454,18 +469,16 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         valid_index_types = (
             pd.DatetimeIndex, 
             pd.RangeIndex,
-            pd.Index  # Общий тип для целочисленных индексов
+            pd.Index
         )
         is_valid_index = (
             isinstance(X.index, valid_index_types) or 
             pd.api.types.is_integer_dtype(X.index)
         )
         if not is_valid_index:
-            # Попытка конвертации в временной индекс
             try:
                 X.index = pd.to_datetime(X.index)
             except:
-                # Если не удается конвертировать — используем RangeIndex
                 X = X.reset_index(drop=True)
         
         # Валидация целевой переменной
@@ -478,7 +491,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             if not isinstance(y, pd.Series):
                 raise TimeSeriesError(f"y must be pd.Series or np.ndarray, got {type(y)}")
             
-            # Проверка соответствия длин
             if len(y) != len(X):
                 raise TimeSeriesError(
                     f"X and y have inconsistent lengths: {len(X)} vs {len(y)}"
@@ -495,24 +507,21 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         lags = []
         if has_time_index:
             freq = pd.infer_freq(X.index)
-            if freq and 'T' in freq:  # минутная частота
-                lags = [1, 4, 96, 672]  # 15 мин, 1 час, 24 часа, 7 дней
-            elif freq and 'h' in freq or freq and 'H' in freq:  # часовая частота
-                lags = [1, 24, 168]      # 1 час, 24 часа, 7 дней
-            elif freq and 'D' in freq:  # дневная частота
-                lags = [1, 7, 30, 365]   # 1 день, неделя, месяц, год
+            if freq and 'T' in freq:
+                lags = [1, 4, 96, 672]
+            elif freq and 'h' in freq or freq and 'H' in freq:
+                lags = [1, 24, 168]
+            elif freq and 'D' in freq:
+                lags = [1, 7, 30, 365]
             else:
                 lags = [1, min(24, n_samples//10), min(168, n_samples//2)]
         else:
-            # Для не временных индексов используем относительные лаги
             lags = [1, min(10, n_samples//20), min(50, n_samples//5)]
         
-        # Фильтруем лаги, которые возможны для данного размера данных
         lags = [lag for lag in lags if lag < n_samples]
         
         transformers = []
         
-        # Добавляем обязательные лаги
         if lags:
             transformers.append(
                 (
@@ -522,7 +531,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 )
             )
         
-        # Добавляем rolling-статистики
         if lags:
             window_size = max(lags) + 1
             transformers.append(
@@ -544,15 +552,12 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         Создание фиксированного пайплайна по умолчанию без оптимизации.
         Пайплайн адаптируется на основе базовых мета-признаков ряда.
         """
-        # Анализируем базовые характеристики ряда
         has_time_index = isinstance(X.index, pd.DatetimeIndex)
         n_samples = len(X)
         
-        # Определяем разумные параметры по умолчанию
         window_size = 24 if n_samples >= 100 else max(6, n_samples // 10)
         use_stl = has_time_index and n_samples >= 100
         
-        # Создаем трансформеры
         transformers = [
             (
                 "window",
@@ -565,11 +570,11 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             ),
         ]
         
-        # Добавляем DWT ТОЛЬКО если достаточно данных и pywt доступен
+        # 🔑 БЕЗОПАСНОЕ ДОБАВЛЕНИЕ DWT
         if n_samples >= 50:
             try:
                 max_level = min(3, pywt.dwt_max_level(n_samples, "db4"))
-                if max_level >= 1:  # Проверяем, что хотя бы 1 уровень возможен
+                if max_level >= 1:
                     transformers.append(
                         (
                             "dwt",
@@ -581,11 +586,9 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                         ),
                     )
             except (ImportError, ValueError) as e:
-                # Если pywt не доступен или данных недостаточно — пропускаем DWT
                 if self.verbose >= 2:
                     print(f"Warning: DWT skipped due to: {e}")
         
-        # Добавляем STL при наличии временного индекса и достаточной длины
         if use_stl:
             transformers.append(
                 (
@@ -595,7 +598,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 )
             )
         
-        # Добавляем временные кодировки при наличии временного индекса
         if has_time_index:
             transformers.append(
                 (
@@ -621,19 +623,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         return FeatureEngineeringPipeline(transformers)
     
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
-        """
-        Получение параметров для совместимости с интерфейсом sklearn.
-        
-        Параметры
-        ----------
-        deep : bool, по умолчанию True
-            Игнорируется (требуется для совместимости).
-        
-        Возвращает
-        ----------
-        params : Dict[str, Any]
-            Словарь параметров.
-        """
+        """Получение параметров для совместимости с интерфейсом sklearn."""
         return {
             "optimize": self.optimize,
             "use_meta_features": self.use_meta_features,
@@ -648,22 +638,11 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             "shap_n_features": self.shap_n_features,
             "random_state": self.random_state,
             "verbose": self.verbose,
+            "optimizer_config": self.optimizer_config,  # ← ДОБАВЛЕНО
         }
     
     def set_params(self, **params) -> "AutoFeatureEngineer":
-        """
-        Установка параметров для совместимости с интерфейсом sklearn.
-        
-        Параметры
-        ----------
-        **params : Dict[str, Any]
-            Параметры для установки.
-        
-        Возвращает
-        ----------
-        self : AutoFeatureEngineer
-            Обновленный инженер признаков.
-        """
+        """Установка параметров для совместимости с интерфейсом sklearn."""
         for key, value in params.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -672,23 +651,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         return self
     
     def save(self, path: str) -> None:
-        """
-        Сохранение состояния обученного инженера признаков.
-        
-        Параметры
-        ----------
-        path : str
-            Путь для сохранения состояния (в формате pickle).
-        
-        Примечание
-        ----------
-        Для полного восстановления требуется сохранить также:
-        - Оптимальный пайплайн преобразований
-        - Селектор признаков (если использовался)
-        - Мета-признаки
-        
-        Рекомендуется использовать вместе с `load()` для восстановления.
-        """
+        """Сохранение состояния обученного инженера признаков."""
         try:
             import pickle
             
@@ -713,33 +676,15 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
     
     @classmethod
     def load(cls, path: str) -> "AutoFeatureEngineer":
-        """
-        Загрузка состояния обученного инженера признаков.
-        
-        Параметры
-        ----------
-        path : str
-            Путь к сохраненному состоянию.
-        
-        Возвращает
-        ----------
-        engineer : AutoFeatureEngineer
-            Восстановленный инженер признаков.
-        
-        Примечание
-        ----------
-        Требует установки всех зависимостей, использованных при обучении.
-        """
+        """Загрузка состояния обученного инженера признаков."""
         try:
             import pickle
             
             with open(path, "rb") as f:
                 state = pickle.load(f)
             
-            # Создаем новый инстанс с сохраненными параметрами
             engineer = cls(**state["params"])
             
-            # Восстанавливаем внутреннее состояние
             engineer.best_pipeline_ = state["best_pipeline"]
             engineer.selector_ = state["selector"]
             engineer.meta_features_ = state["meta_features"]
@@ -761,37 +706,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         plot_correlation_matrix: bool = True,
         save_plots: bool = True
     ) -> Dict[str, Any]:
-        """
-        Анализ эффективности различных стратегий отбора признаков.
-        
-        Параметры
-        ----------
-        X : pd.DataFrame или np.ndarray
-            Входные данные временного ряда.
-        y : pd.Series или np.ndarray, опционально
-            Целевая переменная (требуется для корреляции/модельных методов).
-        comparison_methods : List[str], по умолчанию ["shap", "pearson", ...]
-            Список методов для сравнения:
-            - "shap": SHAP важность (требует обученной модели)
-            - "pearson": Корреляция Пирсона с целевой переменной
-            - "f_regression": F-статистика ANOVA
-            - "mutual_info": Взаимная информация
-        top_k : int, по умолчанию 20
-            Количество признаков для отбора по каждой стратегии.
-        plot_correlation_matrix : bool, по умолчанию True
-            Строить ли матрицу корреляций между отобранными признаками.
-        save_plots : bool, по умолчанию True
-            Сохранять ли графики на диск.
-        
-        Возвращает
-        ----------
-        analysis_results : Dict[str, Any]
-            Словарь с результатами анализа:
-            - 'selected_features_by_method': Dict[str, List[str]]
-            - 'correlation_matrices': Dict[str, pd.DataFrame]
-            - 'intersection_analysis': pd.DataFrame
-            - 'performance_comparison': pd.DataFrame (если y предоставлена)
-        """
+        """Анализ эффективности различных стратегий отбора признаков."""
         from sklearn.feature_selection import f_regression, mutual_info_regression, SelectKBest
         from sklearn.linear_model import Ridge
         import matplotlib.pyplot as plt
@@ -803,18 +718,15 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         if y is None and any(m in comparison_methods for m in ["pearson", "f_regression", "mutual_info"]):
             raise ValueError("Target variable 'y' is required for correlation/model-based selection methods.")
         
-        # Шаг 1: Генерация признаков через обученный пайплайн
         X_transformed = self.best_pipeline_.transform(X)
         
         if self.apply_selection and self.selector_ is not None:
-            # Если пост-селектор уже обучен, применяем его для согласованности
             X_transformed = self.selector_.transform(X_transformed)
         
         print(f"Анализ отбора признаков на {X_transformed.shape[1]} сгенерированных признаках...")
         
         results = {}
         
-        # Метод 1: SHAP (если модель обучена)
         if "shap" in comparison_methods and hasattr(self, 'model_') and self.model_ is not None:
             try:
                 import shap
@@ -829,30 +741,25 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             except Exception as e:
                 print(f"Ошибка при SHAP-анализе: {e}")
         
-        # Метод 2: Корреляция Пирсона
         if "pearson" in comparison_methods and y is not None:
             correlations = X_transformed.corrwith(y).abs().sort_values(ascending=False)
             results["pearson"] = correlations.head(top_k).index.tolist()
         
-        # Метод 3: F-регрессия
         if "f_regression" in comparison_methods and y is not None:
             selector_f = SelectKBest(score_func=f_regression, k=top_k)
             X_f_selected = selector_f.fit_transform(X_transformed.fillna(0), y)
             results["f_regression"] = X_transformed.columns[selector_f.get_support()].tolist()
         
-        # Метод 4: Взаимная информация
         if "mutual_info" in comparison_methods and y is not None:
             mi_scores = mutual_info_regression(X_transformed.fillna(0), y, random_state=42)
             mi_feature_scores = pd.Series(mi_scores, index=X_transformed.columns).sort_values(ascending=False)
             results["mutual_info"] = mi_feature_scores.head(top_k).index.tolist()
         
-        # Проверяем, что хотя бы один метод сработал
         if not results:
             raise ValueError("Ни один из запрошенных методов отбора не может быть применен.")
         
         print(f"Отбор выполнено по {len(results)} методам: {list(results.keys())}")
         
-        # Шаг 2: Анализ пересечений
         from itertools import combinations
         intersection_analysis = []
         for method1, method2 in combinations(results.keys(), 2):
@@ -870,7 +777,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         
         intersection_df = pd.DataFrame(intersection_analysis)
         
-        # Шаг 3: Матрицы корреляций
         correlation_matrices = {}
         if plot_correlation_matrix:
             for method_name, selected_features in results.items():
@@ -897,7 +803,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                     plt.close()
                     print(f"  Матрица корреляций для {method_name} сохранена как 'correlation_matrix_{method_name}.png'")
         
-        # Шаг 4: Сравнение производительности (если предоставлена целевая переменная)
         performance_comparison = None
         if y is not None:
             model_for_comparison = Ridge(alpha=1.0, random_state=42)
@@ -908,7 +813,6 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                     continue
                 X_subset = X_transformed[selected_features].fillna(0)
                 
-                # Кросс-валидация
                 from sklearn.model_selection import cross_val_score
                 scores = cross_val_score(model_for_comparison, X_subset, y, cv=3, scoring='neg_mean_absolute_error')
                 mean_mae = -scores.mean()

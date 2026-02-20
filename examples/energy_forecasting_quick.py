@@ -13,6 +13,11 @@
 - Упрощённые модели (меньше деревьев, меньшая глубина)
 - Отключены тяжёлые операции (SHAP, сложные визуализации)
 - Минимальное количество признаков
+
+Использует Optimizer v2.0:
+- Out-of-sample penalties для честной оценки
+- Semantic entropy для разнообразия признаков
+- Relative score vs naive для переносимости между задачами
 """
 
 import os
@@ -27,7 +32,8 @@ import matplotlib.pyplot as plt
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
-from ts_feature_eng import AutoFeatureEngineer
+from ts_feature_eng import AutoFeatureEngineer, OptimizerConfig  # ← НОВЫЙ ИМПОРТ
+from ts_feature_eng.utils.metrics import relative_score, naive_gain  # ← НОВЫЕ МЕТРИКИ
 from ts_feature_eng.transformers.lag import LagTransformer
 from ts_feature_eng.transformers.window import WindowTransformer
 
@@ -48,6 +54,37 @@ EXPERIMENT_CONFIG = {
     "random_state": 42,           # Сид для воспроизводимости
     "train_test_split": 0.8,      # Доля обучающей выборки
 }
+
+# ============================================================================
+# КОНФИГУРАЦИЯ ОПТИМИЗАТОРА (УПРОЩЁННАЯ ДЛЯ БЫСТРЫХ ТЕСТОВ)
+# ============================================================================
+OPTIMIZER_CONFIG = OptimizerConfig(
+    # Упрощённые штрафы для скорости
+    dominance_lambda=0.3,          # Мягкий штраф за доминирование
+    naive_lambda=0.2,              # Мягкий штраф за копирование lag_1
+    entropy_lambda=0.05,           # Минимальный бонус за разнообразие
+    collapse_lambda=0.2,           # Штраф за feature collapse
+    
+    # Пороги
+    dominance_threshold=0.75,      # Макс. доля важности одного признака
+    naive_corr_threshold=0.95,     # Макс. корреляция с lag_1
+    
+    # Отключаем тяжёлые операции для скорости
+    scale_penalties=False,         # Не масштабируем штрафы (быстрее)
+    use_oof_penalties=False,       # Не считаем OOF (быстрее)
+    
+    # Диагностика
+    log_diagnostics=True,          # Логировать диагностические метрики
+    diagnostics_file="results/optimization_diagnostics.csv",         
+        
+    # Отключаем horizon-aware для скорости
+    use_horizon_aware=False,
+    forecast_horizons=[1],
+    
+    # Search space
+    use_conditional_space=True,
+    use_progressive_modes=False,
+)
 
 
 def get_experiment_id(config):
@@ -83,9 +120,14 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
         "experiment_id": experiment_id,
         "mae_mw": metrics.get("MAE", np.nan),
         "r2": metrics.get("R2", np.nan),
+        "relative_score": metrics.get("Relative Score vs Naive", np.nan),  # ← НОВАЯ МЕТРИКА
+        "naive_gain": metrics.get("Naive Gain", np.nan),                  # ← НОВАЯ МЕТРИКА
         "n_features": metrics.get("n_features", 0),
         "n_train_samples": metrics.get("n_train_samples", 0),
         "n_test_samples": metrics.get("n_test_samples", 0),
+        # Диагностика оптимизатора
+        "max_feature_share": metrics.get("max_feature_share", np.nan),
+        "naive_corr": metrics.get("naive_corr", np.nan),
     }
     
     # Проверяем, существует ли файл
@@ -127,6 +169,12 @@ def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
         "timestamp": timestamp,
         "experiment_id": experiment_id,
         "config": config,
+        "optimizer_config": {
+            "dominance_lambda": OPTIMIZER_CONFIG.dominance_lambda,
+            "naive_lambda": OPTIMIZER_CONFIG.naive_lambda,
+            "entropy_lambda": OPTIMIZER_CONFIG.entropy_lambda,
+            "use_oof_penalties": OPTIMIZER_CONFIG.use_oof_penalties,
+        },
         "metrics": metrics,
     }
     
@@ -232,7 +280,8 @@ def quick_feature_engineering(X, y, n_calls=3, random_state=42):
         variance_threshold=0.05,
         shap_selection=False,  # Отключаем SHAP для скорости
         random_state=random_state,
-        verbose=1
+        verbose=1,
+        optimizer_config=OPTIMIZER_CONFIG  # ← ПЕРЕДАЁМ КОНФИГУРАЦИЮ
     )
     
     X_transformed = engineer.fit_transform(X, y)
@@ -281,8 +330,16 @@ def quick_model_training(X_train, y_train, X_test, y_test, config):
 
 def main():
     print("=" * 70)
-    print("БЫСТРЫЙ ТЕСТ: ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ")
+    print("БЫСТРЫЙ ТЕСТ: ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ (OPTIMIZER v2.0)")
     print("=" * 70)
+    
+    # 🔑 ЛОГИРОВАНИЕ КОНФИГУРАЦИИ ОПТИМИЗАТОРА
+    print(f"\nКонфигурация оптимизатора:")
+    print(f"  • dominance_lambda: {OPTIMIZER_CONFIG.dominance_lambda}")
+    print(f"  • naive_lambda: {OPTIMIZER_CONFIG.naive_lambda}")
+    print(f"  • entropy_lambda: {OPTIMIZER_CONFIG.entropy_lambda}")
+    print(f"  • use_oof_penalties: {OPTIMIZER_CONFIG.use_oof_penalties}")
+    print(f"  • scale_penalties: {OPTIMIZER_CONFIG.scale_penalties}")
     
     # Генерируем ID эксперимента
     experiment_id = get_experiment_id(EXPERIMENT_CONFIG)
@@ -344,8 +401,35 @@ def main():
         print(f"   Итераций выполнено: {len(history)}")
         print(f"   Лучшая метрика: {history['score'].max():.4f}")
     
-    # 8. Сохранение результатов в CSV
-    print("\n8. Сохранение результатов...")
+    # 8. Вычисление relative metrics (с обработкой NaN)
+    print("\n8. Вычисление relative metrics...")
+    lag1_col = [c for c in X_test_eng.columns if "lag_1" in c and "core_lags" in c]
+    if lag1_col and lag1_col[0] in X_test_eng.columns:
+        y_test_lag1 = X_test_eng[lag1_col[0]].values
+        
+        # Удаляем NaN для корректного сравнения
+        valid_mask = ~np.isnan(y_test_lag1) & ~np.isnan(y_test.values)
+        if valid_mask.sum() > 10:  # Минимум 10 валидных наблюдений
+            y_test_clean = y_test.values[valid_mask]
+            y_test_lag1_clean = y_test_lag1[valid_mask]
+            y_pred_clean = model.predict(X_test_eng.fillna(0))[valid_mask]
+            
+            naive_mae = mean_absolute_error(y_test_clean, y_test_lag1_clean)
+            metrics["Relative Score vs Naive"] = relative_score(metrics["MAE"], naive_mae)
+            metrics["Naive Gain"] = naive_gain(y_test_clean, y_pred_clean, y_test_lag1_clean)
+            metrics["Naive MAE"] = naive_mae
+            
+            rel_score = metrics["Relative Score vs Naive"]
+            status = "ЛУЧШЕ NAIVE" if rel_score < 1.0 else "⚠ ХУЖЕ NAIVE"
+            print(f"   Relative Score vs Naive: {rel_score:.4f} {status}")
+            print(f"   Naive Gain: {metrics['Naive Gain']:.2f} МВт")
+        else:
+            print("   ⚠ Недостаточно валидных данных для relative metrics")
+    else:
+        print("   ⚠ Lag_1 признак не найден")
+    
+    # 9. Сохранение результатов в CSV
+    print("\n9. Сохранение результатов...")
     metrics_file, params_file, report_file = save_results_to_csv(
         metrics=metrics,
         config=EXPERIMENT_CONFIG,
@@ -353,8 +437,8 @@ def main():
         results_dir="results"
     )
     
-    # 9. Минимальная визуализация
-    print("\n9. Сохранение мини-графика...")
+    # 10. Минимальная визуализация
+    print("\n10. Сохранение мини-графика...")
     try:
         fig, ax = plt.subplots(figsize=(8, 4))
         viz_size = min(100, len(y_test))
