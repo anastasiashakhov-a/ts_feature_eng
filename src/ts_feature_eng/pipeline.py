@@ -2,17 +2,14 @@
 
 """
 Основной пайплайн автоматической инженерии признаков для временных рядов.
-
 Предоставляет единый интерфейс AutoFeatureEngineer для адаптивного подбора
 оптимальных методов преобразования временных рядов с минимальным участием пользователя.
 """
-
 from typing import Any, Dict, List, Optional, Union
-
 import numpy as np
 import pandas as pd
+import pywt  as pywt
 from sklearn.base import BaseEstimator, TransformerMixin
-
 from .base import TimeSeriesError
 from .meta_features import MetaFeatureExtractor
 from .optimization import FeatureEngineeringOptimizer, FeatureEngineeringPipeline
@@ -21,6 +18,7 @@ from .transformers.window import WindowTransformer
 from .transformers.lag import LagTransformer
 from .transformers.spectral import DWTTransformer, STLTransformer
 from .transformers.time_encoding import TimeEncodingTransformer, CalendarFeaturesTransformer
+
 
 class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
     """
@@ -199,48 +197,70 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         
         # Шаг 3: Поиск оптимального auto pipeline (если требуется)
         if self.optimize:
-            if self.verbose >= 1:
-                print(f"Запуск байесовской оптимизации ({self.n_calls} итераций)...")
+            try:
+                if self.verbose >= 1:
+                    print(f"Запуск байесовской оптимизации ({self.n_calls} итераций)...")
+                
+                # Создаем оптимизатор с настройками пользователя
+                optimizer = FeatureEngineeringOptimizer(
+                    model=self.model,
+                    metric=self.metric,
+                    n_calls=self.n_calls,
+                    n_initial_points=self.n_initial_points,
+                    random_state=self.random_state,
+                    use_meta_features=self.use_meta_features,
+                    verbose=self.verbose >= 2
+                )
+                
+                # Запускаем оптимизацию только для auto-компонентов
+                best_auto_pipeline, best_params, best_score = optimizer.optimize(
+                    X, y, meta_features=self.meta_features_
+                )
+                
+                # Комбинируем core и auto пайплайны
+                combined_transformers = core_pipeline.transformers + best_auto_pipeline.transformers
+                self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
+
+                self.best_pipeline_.fit(X, y)
+                
+                self.optimization_history_ = optimizer.get_search_history()
+                
+                if self.verbose >= 1:
+                    print(f"Оптимизация завершена. Лучшая метрика: {best_score:.4f}")
+                    active_transformers = [name for name, _, active in combined_transformers if active]
+                    print(f"Активные трансформеры: {active_transformers}")
             
-            # Создаем оптимизатор с настройками пользователя
-            optimizer = FeatureEngineeringOptimizer(
-                model=self.model,
-                metric=self.metric,
-                n_calls=self.n_calls,
-                n_initial_points=self.n_initial_points,
-                random_state=self.random_state,
-                use_meta_features=self.use_meta_features,
-                verbose=self.verbose >= 2
-            )
-            
-            # Запускаем оптимизацию только для auto-компонентов
-            best_auto_pipeline, best_params, best_score = optimizer.optimize(
-                X, y, meta_features=self.meta_features_
-            )
-            
-            # Комбинируем core и auto пайплайны
-            combined_transformers = core_pipeline.transformers + best_auto_pipeline.transformers
-            self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
-            
-            self.optimization_history_ = optimizer.get_search_history()
-            
-            if self.verbose >= 1:
-                print(f"Оптимизация завершена. Лучшая метрика: {best_score:.4f}")
-                active_transformers = [name for name, _, active in combined_transformers if active]
-                print(f"Активные трансформеры: {active_transformers}")
+            except Exception as e:
+                if self.verbose >= 1:
+                    print(f"Warning: Optimization failed: {e}. Using default pipeline.")
+                # Создаём дефолтный пайплайн при ошибке оптимизации
+                default_pipeline = self._create_default_pipeline(X)
+                combined_transformers = core_pipeline.transformers + default_pipeline.transformers
+                self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
+                self.best_pipeline_.fit(X, y)
         
         else:
             # Используем фиксированный пайплайн по умолчанию
-            if self.verbose >= 1:
-                print("Использование фиксированного пайплайна по умолчанию (без оптимизации)...")
+            try:
+                if self.verbose >= 1:
+                    print("Использование фиксированного пайплайна по умолчанию (без оптимизации)...")
+                
+                # Создаем разумный пайплайн по умолчанию на основе мета-признаков
+                default_pipeline = self._create_default_pipeline(X)
+                combined_transformers = core_pipeline.transformers + default_pipeline.transformers
+                self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
+                
+                self.best_pipeline_.fit(X, y)
+                
+                if self.verbose >= 1:
+                    print("Фиксированный пайплайн создан")
             
-            # Создаем разумный пайплайн по умолчанию на основе мета-признаков
-            default_pipeline = self._create_default_pipeline(X)
-            combined_transformers = core_pipeline.transformers + default_pipeline.transformers
-            self.best_pipeline_ = FeatureEngineeringPipeline(combined_transformers)
-            
-            if self.verbose >= 1:
-                print("Фиксированный пайплайн создан")
+            except Exception as e:
+                if self.verbose >= 1:
+                    print(f"Warning: Failed to create default pipeline: {e}. Using core pipeline only.")
+                # Используем только core pipeline
+                self.best_pipeline_ = core_pipeline
+                self.best_pipeline_.fit(X, y)
         
         # Шаг 4: Применение постфильтрации признаков
         if self.apply_selection:
@@ -251,8 +271,8 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 missing_threshold=self.selection_threshold,
                 variance_threshold=self.variance_threshold,
                 shap_n_features=self.shap_n_features if self.shap_selection else None,
-                shap_model=self.model,
-                skip_shap=not self.shap_selection
+                model=self.model,  # ← ИСПРАВЛЕНО: было shap_model
+                skip_selection=not self.shap_selection  # ← ИСПРАВЛЕНО: было skip_shap
             )
             
             # Генерируем признаки для обучения селектора
@@ -304,6 +324,11 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         if not self.is_fitted_:
             raise TimeSeriesError(
                 "AutoFeatureEngineer is not fitted. Call fit() before transform()."
+            )
+        
+        if self.best_pipeline_ is None:
+            raise TimeSeriesError(
+                "best_pipeline_ is None. The fit() method may have failed to create a pipeline."
             )
         
         # Валидация входных данных
@@ -472,7 +497,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
             freq = pd.infer_freq(X.index)
             if freq and 'T' in freq:  # минутная частота
                 lags = [1, 4, 96, 672]  # 15 мин, 1 час, 24 часа, 7 дней
-            elif freq and 'H' in freq:  # часовая частота
+            elif freq and 'h' in freq or freq and 'H' in freq:  # часовая частота
                 lags = [1, 24, 168]      # 1 час, 24 часа, 7 дней
             elif freq and 'D' in freq:  # дневная частота
                 lags = [1, 7, 30, 365]   # 1 день, неделя, месяц, год
@@ -517,18 +542,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
     def _create_default_pipeline(self, X: pd.DataFrame) -> FeatureEngineeringPipeline:
         """
         Создание фиксированного пайплайна по умолчанию без оптимизации.
-        
         Пайплайн адаптируется на основе базовых мета-признаков ряда.
-        
-        Параметры
-        ----------
-        X : pd.DataFrame
-            Входные данные для анализа структуры.
-        
-        Возвращает
-        ----------
-        pipeline : FeatureEngineeringPipeline
-            Настроенный пайплайн преобразований.
         """
         # Анализируем базовые характеристики ряда
         has_time_index = isinstance(X.index, pd.DatetimeIndex)
@@ -549,15 +563,27 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                 ),
                 True
             ),
-            (
-                "dwt",
-                DWTTransformer(
-                    wavelet="db4",
-                    max_level=min(3, pywt.dwt_max_level(n_samples, "db4"))
-                ),
-                n_samples >= 50  # DWT требует минимум 50 наблюдений
-            ),
         ]
+        
+        # Добавляем DWT ТОЛЬКО если достаточно данных и pywt доступен
+        if n_samples >= 50:
+            try:
+                max_level = min(3, pywt.dwt_max_level(n_samples, "db4"))
+                if max_level >= 1:  # Проверяем, что хотя бы 1 уровень возможен
+                    transformers.append(
+                        (
+                            "dwt",
+                            DWTTransformer(
+                                wavelet="db4",
+                                max_level=max_level
+                            ),
+                            True
+                        ),
+                    )
+            except (ImportError, ValueError) as e:
+                # Если pywt не доступен или данных недостаточно — пропускаем DWT
+                if self.verbose >= 2:
+                    print(f"Warning: DWT skipped due to: {e}")
         
         # Добавляем STL при наличии временного индекса и достаточной длины
         if use_stl:
@@ -581,15 +607,16 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
                     True
                 )
             )
-            transformers.append(
-                (
-                    "calendar",
-                    CalendarFeaturesTransformer(
-                        features=["part_of_day", "is_weekend"]
-                    ),
-                    True
-                )
+        
+        transformers.append(
+            (
+                "calendar",
+                CalendarFeaturesTransformer(
+                    features=["part_of_day", "is_weekend"]
+                ),
+                True
             )
+        )
         
         return FeatureEngineeringPipeline(transformers)
     
@@ -724,8 +751,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         
         except Exception as e:
             raise TimeSeriesError(f"Ошибка при загрузке состояния: {e}")
-
-
+    
     def analyze_feature_selection(
         self,
         X: Union[pd.DataFrame, np.ndarray],
@@ -789,7 +815,7 @@ class AutoFeatureEngineer(BaseEstimator, TransformerMixin):
         results = {}
         
         # Метод 1: SHAP (если модель обучена)
-        if "shap" in comparison_methods and self.model_ is not None:
+        if "shap" in comparison_methods and hasattr(self, 'model_') and self.model_ is not None:
             try:
                 import shap
                 explainer = shap.LinearExplainer(self.model_, X_transformed.fillna(0).iloc[:100])
