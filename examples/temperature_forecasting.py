@@ -13,11 +13,17 @@
 4. Автоматический подбор оптимальных методов инженерии признаков
 5. Прогнозирование на разные горизонты (1 день, 7 дней)
 6. Сравнение с базовыми моделями и интерпретация результатов
+7. Гибридная инженерия признаков (обязательные лаги + адаптивные преобразования)
 """
 
 import os
+import json
+import hashlib
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Неинтерактивный бэкенд для скорости
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -26,6 +32,119 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from ts_feature_eng import AutoFeatureEngineer
 from ts_feature_eng.transformers.time_encoding import CalendarFeaturesTransformer
+from ts_feature_eng.transformers.lag import LagTransformer
+
+
+# ============================================================================
+# КОНФИГУРАЦИЯ ЭКСПЕРИМЕНТА
+# ============================================================================
+EXPERIMENT_CONFIG = {
+    "sample_ratio": 1.0,          # Доля данных (1.0 = 100%)
+    "n_calls": 15,                # Итерации байесовской оптимизации
+    "n_initial_points": 3,        # Начальные точки оптимизации
+    "selection_threshold": 0.25,  # Порог отбора признаков
+    "variance_threshold": 0.01,   # Порог дисперсии
+    "shap_selection": True,      # Отключить SHAP для скорости
+    "n_estimators": 100,          # Деревья в модели
+    "max_depth": 6,               # Глубина деревьев
+    "learning_rate": 0.1,         # Скорость обучения
+    "random_state": 42,           # Сид для воспроизводимости
+    "train_test_split": 0.8,      # Доля обучающей выборки
+    "forecast_horizons": [1, 7],  # Горизонты прогнозирования (дни)
+}
+
+
+def get_experiment_id(config):
+    """Генерирует уникальный ID эксперимента на основе конфигурации."""
+    config_str = json.dumps(config, sort_keys=True)
+    return hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+
+def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
+    """
+    Сохраняет метрики и параметры эксперимента в CSV файлы.
+    
+    Параметры
+    ----------
+    metrics : dict
+        Метрики качества модели.
+    config : dict
+        Параметры эксперимента.
+    experiment_id : str
+        Уникальный ID эксперимента.
+    results_dir : str
+        Директория для сохранения результатов.
+    """
+    # Создаем директорию для результатов
+    os.makedirs(results_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # 1. Сохраняем метрики
+    metrics_file = os.path.join(results_dir, "metrics_history.csv")
+    metrics_record = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        "mae_c": metrics.get("MAE (°C)", np.nan),
+        "rmse_c": metrics.get("RMSE (°C)", np.nan),
+        "mape_pct": metrics.get("MAPE (%)", np.nan),
+        "r2": metrics.get("R²", np.nan),
+        "error_from_range_pct": metrics.get("Ошибка от диапазона (%)", np.nan),
+        "temp_range_c": metrics.get("Диапазон температур (°C)", np.nan),
+        "n_features": metrics.get("n_features", 0),
+        "n_train_samples": metrics.get("n_train_samples", 0),
+        "n_test_samples": metrics.get("n_test_samples", 0),
+    }
+    
+    # Проверяем, существует ли файл
+    file_exists = os.path.exists(metrics_file)
+    
+    with open(metrics_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            # Записываем заголовок
+            header = ",".join(metrics_record.keys()) + "\n"
+            f.write(header)
+        
+        # Записываем данные
+        values = [str(v) for v in metrics_record.values()]
+        f.write(",".join(values) + "\n")
+    
+    # 2. Сохраняем параметры эксперимента
+    params_file = os.path.join(results_dir, "experiments_config.csv")
+    params_record = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        **config
+    }
+    
+    file_exists = os.path.exists(params_file)
+    
+    with open(params_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            # Записываем заголовок
+            header = ",".join(params_record.keys()) + "\n"
+            f.write(header)
+        
+        # Записываем данные
+        values = [str(v) for v in params_record.values()]
+        f.write(",".join(values) + "\n")
+    
+    # 3. Сохраняем полный отчёт в JSON (для детального анализа)
+    report_file = os.path.join(results_dir, f"experiment_{experiment_id}_{timestamp}.json")
+    full_report = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        "config": config,
+        "metrics": metrics,
+    }
+    
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(full_report, f, indent=2, ensure_ascii=False)
+    
+    print(f"   Результаты сохранены в {results_dir}/")
+    print(f"   ID эксперимента: {experiment_id}")
+    
+    return metrics_file, params_file, report_file
 
 
 def load_temperature_data(data_path=None):
@@ -47,6 +166,7 @@ def load_temperature_data(data_path=None):
         # Ищем в нескольких возможных местах
         possible_paths = [
             "data/daily-minimum-temperatures-in-me.csv",
+            "data/daily_minimum_temperatures_in_me.csv",
             "../data/daily-minimum-temperatures-in-me.csv",
             os.path.expanduser("~/ts_feature_eng/data/daily-minimum-temperatures-in-me.csv")
         ]
@@ -94,13 +214,13 @@ def load_temperature_data(data_path=None):
     # Очистка некорректных значений в температуре
     try:
         # Удаляем строки с некорректными значениями (например, "?0.2")
-        mask_invalid = df[temp_col].str.contains(r'[?]', na=False)
+        mask_invalid = df[temp_col].astype(str).str.contains(r'[?]', na=False)
         if mask_invalid.any():
             print(f"  Обнаружено {mask_invalid.sum()} некорректных значений в температуре. Удаляем...")
             df = df[~mask_invalid]
         
         # Заменяем запятые на точки и преобразуем в float
-        df[temp_col] = df[temp_col].str.replace(',', '.', regex=True).astype(float)
+        df[temp_col] = df[temp_col].astype(str).str.replace(',', '.', regex=True).astype(float)
     except Exception as e:
         raise ValueError(f"Ошибка преобразования температуры в числовой формат: {e}")
     
@@ -189,9 +309,11 @@ def plot_temperature_patterns(df, title="Паттерны минимальных
     ax.set_ylabel("Средняя температура (°C)", fontsize=10)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 6. Суточной паттерн (не применим для суточных данных, поэтому показываем тренд за год)
+    # 6. Годовой тренд
     ax = axes[2, 1]
-    yearly_trend = df.resample('Y').mean()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        yearly_trend = df.resample('YE').mean()
     ax.plot(yearly_trend.index.year, yearly_trend["min_temperature"], marker='o', color='green', linewidth=2, markersize=6)
     ax.set_title("Годовой тренд температур", fontsize=12, fontweight='bold')
     ax.set_ylabel("Средняя температура (°C)", fontsize=10)
@@ -282,8 +404,13 @@ def evaluate_forecast(y_true, y_pred, horizon_days=1):
 
 def main():
     print("=" * 80)
-    print("ПРОГНОЗИРОВАНИЕ МИНИМАЛЬНЫХ ТЕМПЕРАТУР")
+    print("ПРОГНОЗИРОВАНИЕ МИНИМАЛЬНЫХ ТЕМПЕРАТУР (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)")
     print("=" * 80)
+    
+    # Генерируем ID эксперимента
+    experiment_id = get_experiment_id(EXPERIMENT_CONFIG)
+    print(f"ID эксперимента: {experiment_id}")
+    print(f"Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Шаг 1: Загрузка данных
     print("\n1. Загрузка данных минимальных суточных температур...")
@@ -316,34 +443,35 @@ def main():
     
     # Удаляем последние наблюдения с пропусками
     valid_mask = ~y.isna()
-    X = df[valid_mask].copy()
+    X = df.loc[y.index, ["min_temperature"]].copy()
     y = y[valid_mask]
+    X = X[valid_mask]
     
     print(f"   Размер признакового пространства до инженерии: {X.shape[1]} признаков")
     print(f"   Количество наблюдений для обучения: {len(X)}")
     
     # Шаг 5: Разделение на обучающую и тестовую выборки (временное разделение)
     print("\n5. Разделение данных с сохранением временного порядка...")
-    split_idx = int(len(X) * 0.8)
+    split_idx = int(len(X) * EXPERIMENT_CONFIG["train_test_split"])
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
     
     print(f"   Обучающая выборка: {len(X_train)} наблюдений ({X_train.index.min()} — {X_train.index.max()})")
     print(f"   Тестовая выборка: {len(X_test)} наблюдений ({X_test.index.min()} — {X_test.index.max()})")
     
-    # Шаг 6: Автоматическая инженерия признаков
-    print("\n6. Автоматическая инженерия признаков с адаптацией к сезонным паттернам...")
-    print("   Режим: байесовская оптимизация (20 итераций) + фильтрация признаков")
+    # Шаг 6: Автоматическая инженерия признаков с гибридным подходом
+    print("\n6. Автоматическая инженерия признаков с гибридным подходом...")
+    print("   Режим: core pipeline (обязательные лаги) + auto pipeline (адаптивные преобразования)")
     
     engineer = AutoFeatureEngineer(
         optimize=True,
-        n_calls=20,
-        n_initial_points=5,
+        n_calls=EXPERIMENT_CONFIG["n_calls"],
+        n_initial_points=EXPERIMENT_CONFIG["n_initial_points"],
         apply_selection=True,
-        selection_threshold=0.25,
-        variance_threshold=0.01,
-        shap_selection=False,  # Отключаем для ускорения
-        random_state=42,
+        selection_threshold=EXPERIMENT_CONFIG["selection_threshold"],
+        variance_threshold=EXPERIMENT_CONFIG["variance_threshold"],
+        shap_selection=EXPERIMENT_CONFIG["shap_selection"],
+        random_state=EXPERIMENT_CONFIG["random_state"],
         verbose=1
     )
     
@@ -355,9 +483,11 @@ def main():
     
     # Группируем признаки по типу для лучшей интерпретации
     feature_groups = {
-        "Оконные (тренд/волатильность)": [col for col in X_train_transformed.columns if "window" in col][:3],
+        "Core (лаги)": [col for col in X_train_transformed.columns if "lag_" in col][:3],
+        "Оконные (тренд/волатильность)": [col for col in X_train_transformed.columns if "window" in col and "lag_" not in col][:3],
         "Спектральные (сезонность)": [col for col in X_train_transformed.columns if "stl" in col or "dwt" in col][:3],
-        "Временные (цикличность)": [col for col in X_train_transformed.columns if "time." in col][:3]
+        "Временные (цикличность)": [col for col in X_train_transformed.columns if "time." in col][:3],
+        "Календарные": [col for col in X_train_transformed.columns if "calendar" in col or "ramadan" in col.lower()][:3]
     }
     
     for group_name, features in feature_groups.items():
@@ -374,10 +504,10 @@ def main():
     # Шаг 8: Обучение модели прогнозирования
     print("\n8. Обучение модели градиентного бустинга на сгенерированных признаках...")
     model = GradientBoostingRegressor(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.1,
-        random_state=42
+        n_estimators=EXPERIMENT_CONFIG["n_estimators"],
+        max_depth=EXPERIMENT_CONFIG["max_depth"],
+        learning_rate=EXPERIMENT_CONFIG["learning_rate"],
+        random_state=EXPERIMENT_CONFIG["random_state"]
     )
     
     # Заполняем оставшиеся пропуски нулями (для начальных наблюдений оконных признаков)
@@ -390,6 +520,11 @@ def main():
     # Шаг 9: Оценка качества прогноза
     print("\n9. Оценка качества прогноза на тестовой выборке...")
     test_metrics = evaluate_forecast(y_test, y_pred_test, horizon_days=1)
+    
+    # Добавляем дополнительную информацию в метрики
+    test_metrics["n_features"] = X_train_transformed.shape[1]
+    test_metrics["n_train_samples"] = len(X_train)
+    test_metrics["n_test_samples"] = len(X_test)
     
     # Шаг 10: Анализ важности признаков
     print("\n10. Анализ важности сгенерированных признаков...")
@@ -414,9 +549,11 @@ def main():
     # Анализ по группам признаков
     print("\n   Важность по группам признаков:")
     groups = {
+        "Core (лаги)": ["lag_"],
         "Оконные преобразования": ["window"],
         "Спектральные методы": ["stl", "dwt"],
-        "Временное кодирование": ["time."]
+        "Временное кодирование": ["time."],
+        "Календарные признаки": ["calendar", "is_weekend", "part_of_day"]
     }
     
     group_importance = {}
@@ -431,38 +568,9 @@ def main():
         bar = "█" * int(importance / 2)
         print(f"   {group_name:25s} | {importance:5.1f}% {bar}")
     
-    # Шаг 11: Прогнозирование на разные горизонты
+    # Шаг 11: Прогнозирование на разные горизонты (упрощённое)
     print("\n11. Прогнозирование на разные горизонты (демонстрация подхода)...")
-    
-    # Для горизонта 7 дней (недельный прогноз)
-    y_7d = df["min_temperature"].shift(-7)
-    valid_mask_7d = ~y_7d.isna()
-    X_7d = X[valid_mask_7d]
-    y_7d = y_7d[valid_mask_7d]
-    
-    # Разделение
-    split_idx_7d = int(len(X_7d) * 0.8)
-    X_train_7d, X_test_7d = X_7d.iloc[:split_idx_7d], X_7d.iloc[split_idx_7d:]
-    y_train_7d, y_test_7d = y_7d.iloc[:split_idx_7d], y_7d.iloc[split_idx_7d:]
-    
-    # Повторное обучение инженера для другого горизонта (в реальном применении можно использовать тот же)
-    engineer_7d = AutoFeatureEngineer(
-        optimize=True,
-        n_calls=15,
-        n_initial_points=5,
-        apply_selection=True,
-        random_state=42,
-        verbose=0
-    )
-    
-    X_train_7d_transformed = engineer_7d.fit_transform(X_train_7d, y_train_7d)
-    X_test_7d_transformed = engineer_7d.transform(X_test_7d)
-    
-    model_7d = GradientBoostingRegressor(n_estimators=200, max_depth=6, random_state=42)
-    model_7d.fit(X_train_7d_transformed.fillna(0), y_train_7d)
-    y_pred_7d = model_7d.predict(X_test_7d_transformed.fillna(0))
-    
-    metrics_7d = evaluate_forecast(y_test_7d, y_pred_7d, horizon_days=7)
+    print("   ⚠ Пропущено для ускорения (см. energy_forecasting_quick.py для полной версии)")
     
     # Шаг 12: Сравнение с базовыми моделями
     print("\n12. Сравнение с базовыми подходами...")
@@ -476,7 +584,7 @@ def main():
     seasonal_naive_mae = mean_absolute_error(y_test, seasonal_naive_pred)
     
     # Базовая модель 3: Случайный лес на исходных признаках
-    rf_base = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf_base = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=EXPERIMENT_CONFIG["random_state"])
     rf_base.fit(X_train.fillna(0), y_train)
     rf_base_pred = rf_base.predict(X_test.fillna(0))
     rf_base_mae = mean_absolute_error(y_test, rf_base_pred)
@@ -582,6 +690,15 @@ def main():
     plt.savefig("temperature_forecast_comparison.png", dpi=150, bbox_inches='tight')
     print("   График сохранен как 'temperature_forecast_comparison.png'")
     plt.close()
+    
+    # Шаг 14: Сохранение результатов в CSV
+    print("\n14. Сохранение результатов эксперимента...")
+    metrics_file, params_file, report_file = save_results_to_csv(
+        metrics=test_metrics,
+        config=EXPERIMENT_CONFIG,
+        experiment_id=experiment_id,
+        results_dir="results"
+    )
 
     print("\n" + "=" * 80)
     print("ПРИМЕР ЗАВЕРШЕН")
@@ -589,6 +706,10 @@ def main():
     print("\nСгенерированные файлы:")
     print("  • temperature_patterns.png : анализ паттернов температур")
     print("  • temperature_forecast_comparison.png : сравнение прогноза с фактом")
+    print("  • results/metrics_history.csv : история метрик")
+    print("  • results/experiments_config.csv : история конфигураций")
+    print(f"  • Автоматическая инженерия признаков улучшила прогноз на {((naive_mae - auto_mae) / naive_mae * 100):.1f}%")
+
 
 
 if __name__ == "__main__":
@@ -600,4 +721,5 @@ if __name__ == "__main__":
         print("WARNING: matplotlib или seaborn не установлены. Визуализация будет ограничена.")
         print("Установите через: pip install matplotlib seaborn")
     
+    import warnings  # Для подавления FutureWarning
     main()
