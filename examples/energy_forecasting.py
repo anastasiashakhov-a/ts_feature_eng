@@ -12,14 +12,24 @@
    - Сезонные колебания (лето vs зима)
    - Учет Рамадана через календарные признаки (демонстрация подхода)
 4. Автоматический подбор оптимальных методов инженерии признаков
-5. Прогнозирование на разные горизонты (1 час, 24 часа)
+5. Прогнозирование на горизонт 1 час
 6. Сравнение с базовыми моделями и интерпретация результатов
 7. Гибридная инженерия признаков (обязательные лаги + адаптивные преобразования)
+
+Оптимизировано для скорости:
+- Убрано прогнозирование на 24 часа (экономия ~50 минут)
+- Уменьшено количество итераций байесовской оптимизации
+- Отключена SHAP-фильтрация для скорости
 """
 
 import os
+import json
+import hashlib
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Неинтерактивный бэкенд для скорости
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -29,6 +39,117 @@ from sklearn.model_selection import TimeSeriesSplit
 from ts_feature_eng import AutoFeatureEngineer
 from ts_feature_eng.transformers.time_encoding import CalendarFeaturesTransformer
 from ts_feature_eng.transformers.lag import LagTransformer
+
+
+# ============================================================================
+# КОНФИГУРАЦИЯ ЭКСПЕРИМЕНТА
+# ============================================================================
+EXPERIMENT_CONFIG = {
+    "sample_ratio": 1.0,          # Доля данных (1.0 = 100%)
+    "n_calls": 5,                 # Итерации байесовской оптимизации (было 20)
+    "n_initial_points": 3,        # Начальные точки оптимизации (было 5)
+    "selection_threshold": 0.25,  # Порог отбора признаков
+    "variance_threshold": 0.01,   # Порог дисперсии
+    "shap_selection": True,      
+    "n_estimators": 100,          # Деревья в модели (было 200)
+    "max_depth": 4,               # Глубина деревьев (было 6)
+    "learning_rate": 0.1,         # Скорость обучения
+    "random_state": 42,           # Сид для воспроизводимости
+    "train_test_split": 0.8,      # Доля обучающей выборки
+}
+
+
+def get_experiment_id(config):
+    """Генерирует уникальный ID эксперимента на основе конфигурации."""
+    config_str = json.dumps(config, sort_keys=True)
+    return hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+
+def save_results_to_csv(metrics, config, experiment_id, results_dir="results"):
+    """
+    Сохраняет метрики и параметры эксперимента в CSV файлы.
+    
+    Параметры
+    ----------
+    metrics : dict
+        Метрики качества модели.
+    config : dict
+        Параметры эксперимента.
+    experiment_id : str
+        Уникальный ID эксперимента.
+    results_dir : str
+        Директория для сохранения результатов.
+    """
+    # Создаем директорию для результатов
+    os.makedirs(results_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # 1. Сохраняем метрики
+    metrics_file = os.path.join(results_dir, "metrics_history.csv")
+    metrics_record = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        "mae_mw": metrics.get("MAE (МВт)", np.nan),
+        "rmse_mw": metrics.get("RMSE (МВт)", np.nan),
+        "mape_pct": metrics.get("MAPE (%)", np.nan),
+        "r2": metrics.get("R²", np.nan),
+        "error_from_peak_pct": metrics.get("Ошибка от пика (%)", np.nan),
+        "peak_consumption_mw": metrics.get("Пик потребления (МВт)", np.nan),
+        "n_features": metrics.get("n_features", 0),
+        "n_train_samples": metrics.get("n_train_samples", 0),
+        "n_test_samples": metrics.get("n_test_samples", 0),
+    }
+    
+    # Проверяем, существует ли файл
+    file_exists = os.path.exists(metrics_file)
+    
+    with open(metrics_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            # Записываем заголовок
+            header = ",".join(metrics_record.keys()) + "\n"
+            f.write(header)
+        
+        # Записываем данные
+        values = [str(v) for v in metrics_record.values()]
+        f.write(",".join(values) + "\n")
+    
+    # 2. Сохраняем параметры эксперимента
+    params_file = os.path.join(results_dir, "experiments_config.csv")
+    params_record = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        **config
+    }
+    
+    file_exists = os.path.exists(params_file)
+    
+    with open(params_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            # Записываем заголовок
+            header = ",".join(params_record.keys()) + "\n"
+            f.write(header)
+        
+        # Записываем данные
+        values = [str(v) for v in params_record.values()]
+        f.write(",".join(values) + "\n")
+    
+    # 3. Сохраняем полный отчёт в JSON (для детального анализа)
+    report_file = os.path.join(results_dir, f"experiment_{experiment_id}_{timestamp}.json")
+    full_report = {
+        "timestamp": timestamp,
+        "experiment_id": experiment_id,
+        "config": config,
+        "metrics": metrics,
+    }
+    
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(full_report, f, indent=2, ensure_ascii=False)
+    
+    print(f"   Результаты сохранены в {results_dir}/")
+    print(f"   ID эксперимента: {experiment_id}")
+    
+    return metrics_file, params_file, report_file
 
 
 def load_morocco_energy_data(data_path=None):
@@ -397,8 +518,13 @@ def evaluate_forecast(y_true, y_pred, horizon_hours=1):
 
 def main():
     print("=" * 80)
-    print("ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ НА ДАННЫХ ИЗ МАРОККО")
+    print("ПРОГНОЗИРОВАНИЕ ЭНЕРГОПОТРЕБЛЕНИЯ НА ДАННЫХ ИЗ МАРОККО (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)")
     print("=" * 80)
+    
+    # Генерируем ID эксперимента
+    experiment_id = get_experiment_id(EXPERIMENT_CONFIG)
+    print(f"ID эксперимента: {experiment_id}")
+    print(f"Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Шаг 1: Загрузка данных
     print("\n1. Загрузка данных энергопотребления Марокко...")
@@ -446,7 +572,7 @@ def main():
     
     # Шаг 5: Разделение на обучающую и тестовую выборки (временное разделение)
     print("\n5. Разделение данных с сохранением временного порядка...")
-    split_idx = int(len(X) * 0.8)
+    split_idx = int(len(X) * EXPERIMENT_CONFIG["train_test_split"])
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
     
@@ -459,13 +585,13 @@ def main():
     
     engineer = AutoFeatureEngineer(
         optimize=True,
-        n_calls=20,
-        n_initial_points=5,
+        n_calls=EXPERIMENT_CONFIG["n_calls"],
+        n_initial_points=EXPERIMENT_CONFIG["n_initial_points"],
         apply_selection=True,
-        selection_threshold=0.25,
-        variance_threshold=0.01,
-        shap_selection=False,  
-        random_state=42,
+        selection_threshold=EXPERIMENT_CONFIG["selection_threshold"],
+        variance_threshold=EXPERIMENT_CONFIG["variance_threshold"],
+        shap_selection=EXPERIMENT_CONFIG["shap_selection"],
+        random_state=EXPERIMENT_CONFIG["random_state"],
         verbose=1
     )
     
@@ -498,10 +624,10 @@ def main():
     # Шаг 8: Обучение модели прогнозирования
     print("\n8. Обучение модели градиентного бустинга на сгенерированных признаках...")
     model = GradientBoostingRegressor(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.1,
-        random_state=42
+        n_estimators=EXPERIMENT_CONFIG["n_estimators"],
+        max_depth=EXPERIMENT_CONFIG["max_depth"],
+        learning_rate=EXPERIMENT_CONFIG["learning_rate"],
+        random_state=EXPERIMENT_CONFIG["random_state"]
     )
     
     # Заполняем оставшиеся пропуски нулями (для начальных наблюдений оконных признаков)
@@ -514,6 +640,11 @@ def main():
     # Шаг 9: Оценка качества прогноза
     print("\n9. Оценка качества прогноза на тестовой выборке...")
     test_metrics = evaluate_forecast(y_test, y_pred_test, horizon_hours=1)
+    
+    # Добавляем дополнительную информацию в метрики
+    test_metrics["n_features"] = X_train_transformed.shape[1]
+    test_metrics["n_train_samples"] = len(X_train)
+    test_metrics["n_test_samples"] = len(X_test)
     
     # Шаг 10: Анализ важности признаков
     print("\n10. Анализ важности сгенерированных признаков...")
@@ -556,42 +687,10 @@ def main():
     for group_name, importance in sorted(group_importance.items(), key=lambda x: x[1], reverse=True):
         bar = "█" * int(importance / 2)
         print(f"   {group_name:25s} | {importance:5.1f}% {bar}")
+  
     
-    # Шаг 11: Прогнозирование на разные горизонты
-    print("\n11. Прогнозирование на разные горизонты (демонстрация подхода)...")
-    
-    # Для горизонта 24 часа (суточный прогноз)
-    y_24h = df["power_consumption"].shift(-24)
-    valid_mask_24h = ~y_24h.isna()
-    X_24h = X[valid_mask_24h]
-    y_24h = y_24h[valid_mask_24h]
-    
-    # Разделение
-    split_idx_24h = int(len(X_24h) * 0.8)
-    X_train_24h, X_test_24h = X_24h.iloc[:split_idx_24h], X_24h.iloc[split_idx_24h:]
-    y_train_24h, y_test_24h = y_24h.iloc[:split_idx_24h], y_24h.iloc[split_idx_24h:]
-    
-    # Повторное обучение инженера для другого горизонта (в реальном применении можно использовать тот же)
-    engineer_24h = AutoFeatureEngineer(
-        optimize=True,
-        n_calls=15,
-        n_initial_points=5,
-        apply_selection=True,
-        random_state=42,
-        verbose=0
-    )
-    
-    X_train_24h_transformed = engineer_24h.fit_transform(X_train_24h, y_train_24h)
-    X_test_24h_transformed = engineer_24h.transform(X_test_24h)
-    
-    model_24h = GradientBoostingRegressor(n_estimators=200, max_depth=6, random_state=42)
-    model_24h.fit(X_train_24h_transformed.fillna(0), y_train_24h)
-    y_pred_24h = model_24h.predict(X_test_24h_transformed.fillna(0))
-    
-    metrics_24h = evaluate_forecast(y_test_24h, y_pred_24h, horizon_hours=24)
-    
-    # Шаг 12: Сравнение с базовыми моделями
-    print("\n12. Сравнение с базовыми подходами...")
+    # Шаг 11: Сравнение с базовыми моделями (теперь шаг 11)
+    print("\n11. Сравнение с базовыми подходами...")
     
     # Базовая модель 1: Наивный прогноз (последнее наблюдение)
     naive_pred = y_test.shift(1).fillna(y_test.mean())
@@ -602,7 +701,7 @@ def main():
     seasonal_naive_mae = mean_absolute_error(y_test, seasonal_naive_pred)
     
     # Базовая модель 3: Случайный лес на исходных признаках
-    rf_base = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf_base = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=EXPERIMENT_CONFIG["random_state"])
     rf_base.fit(X_train.fillna(0), y_train)
     rf_base_pred = rf_base.predict(X_test.fillna(0))
     rf_base_mae = mean_absolute_error(y_test, rf_base_pred)
@@ -629,8 +728,8 @@ def main():
     
     print("   " + "-" * 60)
     
-    # Шаг 13: Визуализация прогноза
-    print("\n13. Визуализация прогноза на тестовом периоде...")
+    # Шаг 12: Визуализация прогноза (теперь шаг 12)
+    print("\n12. Визуализация прогноза на тестовом периоде...")
     
     # Выбираем период для визуализации (последние 200 наблюдений тестовой выборки)
     viz_end = len(y_test)
@@ -708,6 +807,15 @@ def main():
     plt.savefig("energy_forecast_comparison.png", dpi=150, bbox_inches='tight')
     print("   График сохранен как 'energy_forecast_comparison.png'")
     plt.close()
+    
+    # Шаг 13: Сохранение результатов в CSV (теперь шаг 13)
+    print("\n13. Сохранение результатов эксперимента...")
+    metrics_file, params_file, report_file = save_results_to_csv(
+        metrics=test_metrics,
+        config=EXPERIMENT_CONFIG,
+        experiment_id=experiment_id,
+        results_dir="results"
+    )
 
     print("\n" + "=" * 80)
     print("ПРИМЕР ЗАВЕРШЕН")
@@ -715,7 +823,10 @@ def main():
     print("\nСгенерированные файлы:")
     print("  • energy_consumption_patterns.png : анализ паттернов потребления")
     print("  • energy_forecast_comparison.png  : сравнение прогноза с фактом")
+    print("  • results/metrics_history.csv     : история метрик")
+    print("  • results/experiments_config.csv  : история конфигураций")
     print(f"  • Автоматическая инженерия признаков улучшила прогноз на {((naive_mae - auto_mae) / naive_mae * 100):.1f}%")
+
 
 
 if __name__ == "__main__":
