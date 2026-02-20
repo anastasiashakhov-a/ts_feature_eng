@@ -428,66 +428,292 @@ class TimeEncodingTransformer(TimeSeriesTransformer):
         
         return X_transformed
     
-    def get_feature_names(self) -> List[str]:
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """
         Получение имен сгенерированных признаков.
         
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        
         Возвращает
         ----------
-        feature_names : List[str]
-            Список имен признаков.
+        feature_names : np.ndarray
+            Массив имен сгенерированных признаков.
+        """
+        if not self.is_fitted_:
+            raise ValueError("TimeEncodingTransformer is not fitted. Call fit() first.")
+        
+        return np.array(self.feature_names_)
+
+
+class Time2VecEncoder(TimeSeriesTransformer):
+    """
+    Трансформер для генерации признаков на основе Time2Vec-подобного подхода.
+    
+    Реализует подход из другого проекта: генерирует богатый набор календарных
+    и циклических признаков на основе временных меток.
+    
+    Параметры
+    ----------
+    time_col : str
+        Имя столбца с временными метками.
+    target_col : str
+        Имя целевой переменной (для нормализации, если требуется).
+    include_trigonometric : bool, по умолчанию True
+        Включать ли циклические (тригонометрические) признаки.
+    include_categorical : bool, по умолчанию True
+        Включать ли категориальные признаки (месяц, день недели и т.д.).
+    include_business_features : bool, по умолчанию True
+        Включать ли признаки рабочего времени и выходных.
+    include_seasonality : bool, по умолчанию True
+        Включать ли признаки сезонности (кварталы, сезоны).
+    normalize_target : bool, по умолчанию False
+        Нормализовать ли целевую переменную (Min-Max).
+    
+    Атрибуты
+    ----------
+    feature_names_ : List[str]
+        Имена сгенерированных признаков.
+    is_fitted_ : bool
+        Флаг, указывающий, был ли вызван метод fit().
+    time_col_ : str
+        Имя используемого временного столбца.
+    target_col_ : str
+        Имя целевого столбца.
+    target_min_ : float или None
+        Минимальное значение целевой переменной (для нормализации).
+    target_max_ : float или None
+        Максимальное значение целевой переменной (для нормализации).
+    """
+    
+    def __init__(
+        self,
+        time_col: str,
+        target_col: str,
+        include_trigonometric: bool = True,
+        include_categorical: bool = True,
+        include_business_features: bool = True,
+        include_seasonality: bool = True,
+        normalize_target: bool = False,
+    ):
+        super().__init__()
+        self.time_col = time_col
+        self.target_col = target_col
+        self.include_trigonometric = include_trigonometric
+        self.include_categorical = include_categorical
+        self.include_business_features = include_business_features
+        self.include_seasonality = include_seasonality
+        self.normalize_target = normalize_target
+    
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Optional[Union[pd.Series, np.ndarray]] = None) -> "Time2VecEncoder":
+        """
+        Обучение трансформера (определение диапазона целевой переменной для нормализации).
+        
+        Параметры
+        ----------
+        X : pd.DataFrame или np.ndarray
+            Входные данные временного ряда.
+        y : pd.Series или np.ndarray, опционально
+            Целевая переменная (игнорируется, используется X[target_col]).
+        
+        Возвращает
+        ----------
+        self : Time2VecEncoder
+            Обученный трансформер.
+        """
+        X = self._validate_input(X)
+        
+        if self.normalize_target:
+            self.target_min_ = X[self.target_col].min()
+            self.target_max_ = X[self.target_col].max()
+        else:
+            self.target_min_ = None
+            self.target_max_ = None
+        
+        self.time_col_ = self.time_col
+        self.target_col_ = self.target_col
+        self.is_fitted_ = True
+        return self
+    
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
+        """
+        Применение Time2Vec-подобного кодирования к данным.
+        
+        Параметры
+        ----------
+        X : pd.DataFrame или np.ndarray
+            Входные данные временного ряда.
+        
+        Возвращает
+        ----------
+        X_transformed : pd.DataFrame
+            DataFrame с сгенерированными временными признаками.
         """
         if not self.is_fitted_:
             raise ValueError("Transformer is not fitted. Call fit() first.")
         
-        return self.feature_names_
-    
-    def get_params(self, deep: bool = True) -> dict:
-        """
-        Получение параметров трансформера (совместимость с sklearn).
+        X = self._validate_input(X)
+        X_copy = X.copy()
         
-        Параметры
-        ----------
-        deep : bool, по умолчанию True
-            Игнорируется.
+        # Преобразование временной метки в datetime, если необходимо
+        X_copy[self.time_col_] = pd.to_datetime(X_copy[self.time_col_])
         
-        Возвращает
-        ----------
-        params : dict
-            Словарь параметров трансформера.
-        """
-        return {
-            "mode": self.mode,
-            "time_col": self.time_col,
-            "cyclic_components": self.cyclic_components,
-            "time2vec_dim": self.time2vec_dim,
-            "time2vec_periodic_func": self.time2vec_periodic_func,
-            "scale_time": self.scale_time,
-            "fit_params": self.fit_params,
-        }
-    
-    def set_params(self, **params) -> "TimeEncodingTransformer":
-        """
-        Установка параметров трансформера (совместимость с sklearn).
+        features = {}
+        feature_names = []
         
-        Параметры
-        ----------
-        **params : dict
-            Параметры для установки.
+        # 1. Категориальные признаки
+        if self.include_categorical:
+            features["time.year"] = X_copy[self.time_col_].dt.year.values
+            features["time.month"] = X_copy[self.time_col_].dt.month.values
+            features["time.day"] = X_copy[self.time_col_].dt.day.values
+            features["time.week"] = X_copy[self.time_col_].dt.isocalendar().week.values
+            features["time.day_of_week"] = X_copy[self.time_col_].dt.dayofweek.values
+            features["time.hour"] = X_copy[self.time_col_].dt.hour.values
+            features["time.minute"] = X_copy[self.time_col_].dt.minute.values
+            features["time.second"] = X_copy[self.time_col_].dt.second.values
+            feature_names.extend([
+                "time.year", "time.month", "time.day", "time.week", 
+                "time.day_of_week", "time.hour", "time.minute", "time.second"
+            ])
         
-        Возвращает
-        ----------
-        self : TimeEncodingTransformer
-            Трансформер с обновленными параметрами.
-        """
-        for key, value in params.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+        # 2. Тригонометрические признаки
+        if self.include_trigonometric:
+            # Час
+            hour = X_copy[self.time_col_].dt.hour.values
+            features["time.hour_sin"] = np.sin(2 * np.pi * hour / 24)
+            features["time.hour_cos"] = np.cos(2 * np.pi * hour / 24)
+            feature_names.extend(["time.hour_sin", "time.hour_cos"])
+            
+            # День недели
+            day_of_week = X_copy[self.time_col_].dt.dayofweek.values
+            features["time.day_of_week_sin"] = np.sin(2 * np.pi * day_of_week / 7)
+            features["time.day_of_week_cos"] = np.cos(2 * np.pi * day_of_week / 7)
+            feature_names.extend(["time.day_of_week_sin", "time.day_of_week_cos"])
+            
+            # Неделя
+            week = X_copy[self.time_col_].dt.isocalendar().week.values
+            features["time.week_sin"] = np.sin(2 * np.pi * week / 52)
+            features["time.week_cos"] = np.cos(2 * np.pi * week / 52)
+            feature_names.extend(["time.week_sin", "time.week_cos"])
+            
+            # Месяц
+            month = X_copy[self.time_col_].dt.month.values
+            features["time.month_sin"] = np.sin(2 * np.pi * month / 12)
+            features["time.month_cos"] = np.cos(2 * np.pi * month / 12)
+            feature_names.extend(["time.month_sin", "time.month_cos"])
+        
+        # 3. Бизнес-признаки
+        if self.include_business_features:
+            hour = X_copy[self.time_col_].dt.hour.values
+            day_of_week = X_copy[self.time_col_].dt.dayofweek.values
+            
+            # Часть дня (0-5: ночь, 6-11: утро, 12-17: день, 18-23: вечер)
+            part_of_day = np.select(
+                [
+                    (hour >= 0) & (hour < 6),
+                    (hour >= 6) & (hour < 12),
+                    (hour >= 12) & (hour < 18),
+                    (hour >= 18) & (hour < 24)
+                ],
+                [0, 1, 2, 3],
+                default=0
+            )
+            features["time.part_of_day"] = part_of_day
+            feature_names.append("time.part_of_day")
+            
+            # Ночь (0-5)
+            features["time.is_night"] = ((hour >= 0) & (hour < 6)).astype(int).values
+            feature_names.append("time.is_night")
+            
+            # Выходной
+            features["time.is_weekend"] = (day_of_week >= 5).astype(int).values
+            feature_names.append("time.is_weekend")
+            
+            # Рабочие часы (9-18)
+            features["time.is_working_hours"] = ((hour >= 9) & (hour <= 18)).astype(int).values
+            feature_names.append("time.is_working_hours")
+        
+        # 4. Сезонные признаки
+        if self.include_seasonality:
+            month = X_copy[self.time_col_].dt.month.values
+            
+            # Сезон
+            season = ((month % 12 + 3) // 3).astype(int)  # 12-2: зима (1), 3-5: весна (2), 6-8: лето (3), 9-11: осень (4)
+            features["time.season"] = season
+            feature_names.append("time.season")
+            
+            # Сезон (циклический)
+            features["time.season_sin"] = np.sin(2 * np.pi * season / 4)
+            features["time.season_cos"] = np.cos(2 * np.pi * season / 4)
+            feature_names.extend(["time.season_sin", "time.season_cos"])
+            
+            # Квартал
+            quarter = X_copy[self.time_col_].dt.quarter.values
+            features["time.quarter"] = quarter
+            feature_names.append("time.quarter")
+            
+            # Квартал (циклический)
+            features["time.quarter_sin"] = np.sin(2 * np.pi * quarter / 4)
+            features["time.quarter_cos"] = np.cos(2 * np.pi * quarter / 4)
+            feature_names.extend(["time.quarter_sin", "time.quarter_cos"])
+        
+        # 5. Дополнительные признаки
+        # День года
+        features["time.day_of_year"] = X_copy[self.time_col_].dt.dayofyear.values
+        feature_names.append("time.day_of_year")
+        
+        # Фаза луны (приблизительно)
+        features["time.moon_phase"] = (X_copy[self.time_col_].dt.day.values % 29.53).astype(int)
+        feature_names.append("time.moon_phase")
+        
+        # Создаем DataFrame с признаками
+        X_transformed = pd.DataFrame(features, index=X.index)
+        
+        # Нормализация целевой переменной, если требуется
+        if self.normalize_target:
+            if self.target_min_ is not None and self.target_max_ is not None:
+                range_val = self.target_max_ - self.target_min_
+                if range_val != 0:
+                    X_transformed[self.target_col] = (X[self.target_col] - self.target_min_) / range_val
+                else:
+                    X_transformed[self.target_col] = 0.0
             else:
-                raise ValueError(f"Invalid parameter {key} for TimeEncodingTransformer")
+                # Если min/max не были вычислены в fit, вычисляем из X
+                min_val = X[self.target_col].min()
+                max_val = X[self.target_col].max()
+                range_val = max_val - min_val
+                if range_val != 0:
+                    X_transformed[self.target_col] = (X[self.target_col] - min_val) / range_val
+                else:
+                    X_transformed[self.target_col] = 0.0
+        else:
+            # Копируем целевую переменную как есть
+            X_transformed[self.target_col] = X[self.target_col].values
         
-        self._validate_params()
-        return self
+        self.feature_names_ = feature_names
+        
+        return X_transformed
+    
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        """
+        Получение имен сгенерированных признаков.
+        
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        
+        Возвращает
+        ----------
+        feature_names : np.ndarray
+            Массив имен сгенерированных признаков.
+        """
+        if not self.is_fitted_:
+            raise ValueError("Time2VecEncoder is not fitted. Call fit() first.")
+        
+        return np.array(self.feature_names_)
 
 
 class CalendarFeaturesTransformer(TimeSeriesTransformer):
@@ -589,10 +815,24 @@ class CalendarFeaturesTransformer(TimeSeriesTransformer):
         return self
     
     def _detect_time_column(self, X: pd.DataFrame) -> str:
-        """Вспомогательный метод для обнаружения временного столбца (повторно используемый)."""
+        """
+        Автоматическое обнаружение столбца или индекса с временными метками.
+        
+        Параметры
+        ----------
+        X : pd.DataFrame
+            Входные данные.
+        
+        Возвращает
+        ----------
+        time_source : str
+            "index" если используется временной индекс, иначе имя столбца.
+        """
+        # Проверка временного индекса
         if isinstance(X.index, pd.DatetimeIndex):
             return "index"
         
+        # Если указан конкретный столбец — используем его
         if self.time_col is not None:
             if self.time_col not in X.columns:
                 raise ValueError(f"Specified time_col '{self.time_col}' not found in DataFrame columns")
@@ -600,11 +840,13 @@ class CalendarFeaturesTransformer(TimeSeriesTransformer):
                 raise ValueError(f"Column '{self.time_col}' is not a datetime column")
             return self.time_col
         
+        # Автоматический поиск столбца с временными данными
         datetime_cols = [
             col for col in X.columns
             if pd.api.types.is_datetime64_any_dtype(X[col])
         ]
         
+        # Поиск по именам столбцов (даже если не datetime тип)
         name_hints = ["timestamp", "date", "datetime", "time", "ds"]
         hinted_cols = [col for col in X.columns if any(hint in col.lower() for hint in name_hints)]
         
@@ -705,16 +947,21 @@ class CalendarFeaturesTransformer(TimeSeriesTransformer):
         
         return X_transformed
     
-    def get_feature_names(self) -> List[str]:
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
         """
         Получение имен сгенерированных признаков.
         
+        Параметры
+        ----------
+        input_features : array-like, опционально
+            Игнорируется (требуется для совместимости с интерфейсом sklearn).
+        
         Возвращает
         ----------
-        feature_names : List[str]
-            Список имен признаков.
+        feature_names : np.ndarray
+            Массив имен сгенерированных признаков.
         """
         if not self.is_fitted_:
-            raise ValueError("Transformer is not fitted. Call fit() first.")
+            raise ValueError("CalendarFeaturesTransformer is not fitted. Call fit() first.")
         
-        return self.feature_names_
+        return np.array(self.feature_names_)
