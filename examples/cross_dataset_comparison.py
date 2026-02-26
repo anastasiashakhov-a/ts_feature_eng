@@ -40,6 +40,7 @@ from ts_feature_eng.utils.experiment_logger import ExperimentManager
 
 warnings.filterwarnings('ignore', message='Provided model function fails when applied to the provided data set.')
 
+# TensorFlow для LSTM (опционально)
 try:
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
@@ -60,18 +61,18 @@ warnings.filterwarnings('ignore', category=UserWarning)
 # КОНФИГУРАЦИЯ СРАВНИТЕЛЬНОГО ЭКСПЕРИМЕНТА
 # ============================================================================
 COMPARISON_CONFIG = {
-    # ← ОПТИМИЗАЦИЯ
+    # Общие параметры
     "random_state": 42,
     "train_test_split": 0.8,
-    "n_calls": 2,                
+    "n_calls": 2,           
     "n_initial_points": 2,
     
-    # Параметры моделей 
-    "n_estimators": 20,         
-    "max_depth": 3,             
+    # Параметры моделей
+    "n_estimators": 20,
+    "max_depth": 3,
     "learning_rate": 0.1,
     
-    # Относительные горизонты
+    # Относительные горизонты (доля от длины ряда)
     "relative_horizons": [0.01, 0.05, 0.10],
     
     # Нормализация метрик
@@ -81,26 +82,16 @@ COMPARISON_CONFIG = {
     # Multi-horizon AUC
     "compute_auc": True,
     "auc_max_relative_horizon": 0.10,
-    "auc_n_points": 3,            
+    "auc_n_points": 3,
     
-    # Параметры LSTM (оптимизировано)
+    # Параметры LSTM
     "lstm_timesteps": 24,
     "lstm_units": 32,
-    "lstm_epochs": 5,            
+    "lstm_epochs": 10,
     "lstm_batch_size": 32,
-    "use_lstm": True,             
+    "use_lstm": False,  # ← Включаем LSTM для сравнения
     
-    # ← НОВОЕ: Явный список моделей для сравнения
-    "models_to_compare": [
-        "naive", 
-        "rf_base", 
-        "rf_auto_fe", 
-        "gb_base", 
-        "gb_auto_fe", 
-        "lstm_base"  
-    ],
-    
-    # Индикатор прогресса
+    # ← НОВОЕ: Индикатор прогресса
     "show_progress": True,
     "progress_bar_width": 40,
     
@@ -110,20 +101,8 @@ COMPARISON_CONFIG = {
     "plots_subdir": "plots",
 }
 
-# ============================================================================
-# КОНФИГУРАЦИИ ДАТАСЕТОВ 
-# ============================================================================
+# Конфигурации датасетов
 DATASET_CONFIGS = {
-    # ПЕРВЫЙ ДАТАСЕТ: Энергия Марокко
-    "energy": {
-        "path": "data/morocco zone 1 - powerconsumption_resampled (1).csv",
-        "time_col": "Datetime",
-        "target_col": "consumption",
-        "freq": "15min",
-        "target_unit": "МВт",
-        "description": "Энергопотребление Марокко, зона 1 (2017)",
-    },
-    # Второй: Температура
     "temperature": {
         "path": "data/daily-minimum-temperatures-in-me.csv",
         "time_col": "Date",
@@ -132,7 +111,14 @@ DATASET_CONFIGS = {
         "target_unit": "°C",
         "description": "Минимальные суточные температуры (1981-1990)",
     },
-    # Третий: ACN Load
+    "energy": {
+        "path": "data/morocco zone 1 - powerconsumption_resampled (1).csv",
+        "time_col": "Datetime",
+        "target_col": "consumption",
+        "freq": "15min",
+        "target_unit": "МВт",
+        "description": "Энергопотребление Марокко, зона 1 (2017)",
+    },
     "acn_load": {
         "path": "data/acn_aggregate_load_timeseries.csv",
         "time_col": "timestamp",
@@ -145,7 +131,7 @@ DATASET_CONFIGS = {
 
 
 # ============================================================================
-# УТИЛИТЫ ПРОГРЕССА
+# ← НОВОЕ: УТИЛИТЫ ПРОГРЕССА
 # ============================================================================
 
 class ProgressTracker:
@@ -383,7 +369,7 @@ def train_lstm_model(X_train: np.ndarray, y_train: np.ndarray,
     try:
         timesteps = config.get("lstm_timesteps", 24)
         units = config.get("lstm_units", 32)
-        epochs = config.get("lstm_epochs", 5)
+        epochs = config.get("lstm_epochs", 10)
         
         model = Sequential([
             Input(shape=(timesteps, X_train.shape[2])),
@@ -413,8 +399,14 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
     """
     Оценка ВСЕХ моделей на заданном горизонте.
     
-    Сравнивает модели из config["models_to_compare"]:
-    - naive, rf_base, rf_auto_fe, gb_base, gb_auto_fe, lstm_base
+    Сравнивает:
+    - Naive
+    - RF базовая
+    - RF auto FE
+    - GB базовая
+    - GB auto FE
+    - LSTM базовая (если включено)
+    - LSTM auto FE (если включено)
     """
     target = df["target"]
     y = target.shift(-horizon)
@@ -442,15 +434,15 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
         "model": None
     }
     
-    # 2. Auto FE + модели (RF и GB)
+    # 2. Auto FE + модели
     try:
         engineer = AutoFeatureEngineer(
             optimize=True,
             n_calls=config["n_calls"],
             n_initial_points=config["n_initial_points"],
             apply_selection=True,
-            selection_threshold=config["selection_threshold"],
-            variance_threshold=config["variance_threshold"],
+            selection_threshold=0.25,
+            variance_threshold=0.01,
             shap_selection=False,
             random_state=config["random_state"],
             verbose=0
@@ -459,7 +451,7 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
         X_train_fe = engineer.fit_transform(X_train, y_train)
         X_test_fe = engineer.transform(X_test)
         
-        # Random Forest - базовые
+        # 3. Random Forest - базовые признаки
         rf_base = RandomForestRegressor(n_estimators=config["n_estimators"], 
                                       max_depth=config["max_depth"],
                                       random_state=config["random_state"])
@@ -473,7 +465,7 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
             "model": rf_base
         }
         
-        # Random Forest - auto FE
+        # 4. Random Forest - auto FE
         rf_auto = RandomForestRegressor(n_estimators=config["n_estimators"], 
                                       max_depth=config["max_depth"],
                                       random_state=config["random_state"])
@@ -488,7 +480,7 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
             "n_features": X_train_fe.shape[1]
         }
         
-        # Gradient Boosting - базовые
+        # 5. Gradient Boosting - базовые признаки
         gb_base = GradientBoostingRegressor(
             n_estimators=config["n_estimators"],
             max_depth=config["max_depth"],
@@ -505,7 +497,7 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
             "model": gb_base
         }
         
-        # Gradient Boosting - auto FE
+        # 6. Gradient Boosting - auto FE
         gb_auto = GradientBoostingRegressor(
             n_estimators=config["n_estimators"],
             max_depth=config["max_depth"],
@@ -523,67 +515,167 @@ def evaluate_models(df: pd.DataFrame, horizon: int, config: Dict,
             "n_features": X_train_fe.shape[1]
         }
         
+        # 7. LSTM - базовые признаки (если включено)
+        if config.get("use_lstm", False) and HAS_TENSORFLOW:
+            try:
+                X_lstm_base = pd.DataFrame({"target": df["target"]})
+                X_tr, X_te, y_tr, y_te, scaler_y = prepare_lstm_data(
+                    X_lstm_base, target.shift(-horizon),
+                    timesteps=config["lstm_timesteps"],
+                    train_split=config["train_test_split"]
+                )
+                
+                lstm_model, lstm_pred_scaled = train_lstm_model(
+                    X_tr, y_tr, X_te, config, verbose=0
+                )
+                
+                if lstm_pred_scaled is not None and len(lstm_pred_scaled) > 0:
+                    lstm_pred = scaler_y.inverse_transform(
+                        lstm_pred_scaled.reshape(-1, 1)
+                    ).ravel()
+                    
+                    if not np.any(np.isnan(lstm_pred)) and not np.any(np.isinf(lstm_pred)):
+                        min_len = min(len(lstm_pred), len(y_test))
+                        lstm_pred = lstm_pred[:min_len]
+                        y_test_trim = y_test.iloc[-min_len:]
+                        
+                        results["lstm_base"] = {
+                            "mae": mean_absolute_error(y_test_trim, lstm_pred),
+                            "rmse": np.sqrt(mean_squared_error(y_test_trim, lstm_pred)),
+                            "r2": r2_score(y_test_trim, lstm_pred),
+                            "pred": lstm_pred,
+                            "model": lstm_model
+                        }
+            except Exception as e:
+                if config.get("verbose", 0) >= 1:
+                    print(f"    ⚠️  LSTM base ошибка: {e}")
+        
+        # 8. LSTM - auto FE (если включено)
+        if config.get("use_lstm", False) and HAS_TENSORFLOW:
+            try:
+                if X_train_fe.shape[1] > 10:
+                    from sklearn.decomposition import PCA
+                    pca = PCA(n_components=min(10, X_train_fe.shape[1]))
+                    X_train_pca = pca.fit_transform(X_train_fe.fillna(0))
+                    X_test_pca = pca.transform(X_test_fe.fillna(0))
+                    X_lstm_auto = pd.DataFrame(X_train_pca, columns=[f"pc_{i}" for i in range(X_train_pca.shape[1])])
+                    X_test_lstm_auto = pd.DataFrame(X_test_pca, columns=[f"pc_{i}" for i in range(X_test_pca.shape[1])])
+                else:
+                    X_lstm_auto = X_train_fe.copy()
+                    X_test_lstm_auto = X_test_fe.copy()
+                
+                X_tr_auto, X_te_auto, y_tr_auto, y_te_auto, scaler_y_auto = prepare_lstm_data(
+                    X_lstm_auto, y, timesteps=config["lstm_timesteps"],
+                    train_split=config["train_test_split"]
+                )
+                
+                lstm_auto_model, lstm_auto_pred_scaled = train_lstm_model(
+                    X_tr_auto, y_tr_auto, X_te_auto, config, verbose=0
+                )
+                
+                if lstm_auto_pred_scaled is not None and len(lstm_auto_pred_scaled) > 0:
+                    lstm_auto_pred = scaler_y_auto.inverse_transform(
+                        lstm_auto_pred_scaled.reshape(-1, 1)
+                    ).ravel()
+                    
+                    if not np.any(np.isnan(lstm_auto_pred)) and not np.any(np.isinf(lstm_auto_pred)):
+                        min_len = min(len(lstm_auto_pred), len(y_test))
+                        lstm_auto_pred = lstm_auto_pred[:min_len]
+                        y_test_auto_trim = y_test.iloc[-min_len:]
+                        
+                        results["lstm_auto_fe"] = {
+                            "mae": mean_absolute_error(y_test_auto_trim, lstm_auto_pred),
+                            "rmse": np.sqrt(mean_squared_error(y_test_auto_trim, lstm_auto_pred)),
+                            "r2": r2_score(y_test_auto_trim, lstm_auto_pred),
+                            "pred": lstm_auto_pred,
+                            "model": lstm_auto_model
+                        }
+            except Exception as e:
+                if config.get("verbose", 0) >= 1:
+                    print(f"    ⚠️  LSTM auto FE ошибка: {e}")
+        
     except Exception as e:
         if config.get("verbose", 0) >= 1:
             print(f"    ⚠️  Auto FE ошибка: {e}")
     
-    # 3. LSTM - базовый (ТОЛЬКО ЕСЛИ В СПИСКЕ МОДЕЛЕЙ)
-    if "lstm_base" in config.get("models_to_compare", []) and config.get("use_lstm", False) and HAS_TENSORFLOW:
-        try:
-            # Используем только целевую переменную для LSTM
-            X_lstm = pd.DataFrame({"target": df["target"]})
-            
-            X_tr, X_te, y_tr, y_te, scaler_y = prepare_lstm_data(
-                X_lstm, target.shift(-horizon),
-                timesteps=config.get("lstm_timesteps", 24),
-                train_split=config["train_test_split"]
-            )
-            
-            lstm_model, lstm_pred_scaled = train_lstm_model(
-                X_tr, y_tr, X_te, config, verbose=0
-            )
-            
-            if lstm_pred_scaled is not None and len(lstm_pred_scaled) > 0:
-                lstm_pred = scaler_y.inverse_transform(
-                    lstm_pred_scaled.reshape(-1, 1)
-                ).ravel()
-                
-                # Проверка на валидность
-                if np.any(np.isnan(lstm_pred)) or np.any(np.isinf(lstm_pred)):
-                    results["lstm_base"] = {"mae": np.nan, "r2": np.nan, "pred": None}
-                else:
-                    # Обрезаем до длины y_test
-                    min_len = min(len(lstm_pred), len(y_test))
-                    lstm_pred = lstm_pred[:min_len]
-                    y_test_trim = y_test.iloc[-min_len:]
-                    
-                    results["lstm_base"] = {
-                        "mae": mean_absolute_error(y_test_trim, lstm_pred),
-                        "r2": r2_score(y_test_trim, lstm_pred),
-                        "pred": lstm_pred,
-                        "model": lstm_model
-                    }
-            else:
-                results["lstm_base"] = {"mae": np.nan, "r2": np.nan, "pred": None}
-                
-        except Exception as e:
-            if config.get("verbose", 0) >= 1:
-                print(f"    ⚠️  LSTM base ошибка: {e}")
-            results["lstm_base"] = {"mae": np.nan, "r2": np.nan, "pred": None}
-    
-    elif "lstm_base" in config.get("models_to_compare", []) and not HAS_TENSORFLOW:
-        results["lstm_base"] = {"mae": np.nan, "r2": np.nan, "pred": None}
-    
-    elif "lstm_base" in config.get("models_to_compare", []) and not config.get("use_lstm", False):
-        results["lstm_base"] = {"mae": np.nan, "r2": np.nan, "pred": None}
-    
     return results
+
+
+def create_detailed_forecast_plot(y_test, best_pred, best_model_name, 
+                                  horizon, dataset_name, manager, timestamps=None):
+    """
+    Создаёт детальный график сравнения прогноза с фактическими значениями.
+    Аналогичен показанному на картинке.
+    """
+    print(f"\n  📊 Создание детального графика прогноза для {best_model_name}...")
+    
+    try:
+        # Берём последние 200 точек для наглядности
+        max_points = min(200, len(y_test))
+        y_test_plot = y_test.iloc[-max_points:]
+        best_pred_plot = best_pred[-max_points:] if hasattr(best_pred, '__len__') else np.full(max_points, best_pred)
+        
+        if timestamps is not None:
+            timestamps_plot = timestamps[-max_points:]
+        else:
+            timestamps_plot = y_test_plot.index
+        
+        # Вычисляем ошибку
+        error = y_test_plot.values - best_pred_plot
+        
+        # Создаём фигуру с двумя подграфиками
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), gridspec_kw={'height_ratios': [2, 1]})
+        
+        # Верхний график: фактические vs прогноз
+        ax1.plot(timestamps_plot, y_test_plot.values, 'b-', linewidth=1.5, label='Фактическая температура')
+        ax1.plot(timestamps_plot, best_pred_plot, 'r--', linewidth=1.5, label='Прогноз (наш метод)')
+        ax1.fill_between(timestamps_plot, y_test_plot.values, best_pred_plot, 
+                        alpha=0.3, color='gray', label=f'Ошибка (MAE: {np.mean(np.abs(error)):.2f} °C)')
+        
+        ax1.set_title(f"Прогноз минимальных температур (последние {max_points} дней тестовой выборки)", 
+                     fontsize=12, fontweight='bold')
+        ax1.set_ylabel("Температура (°C)", fontsize=10)
+        ax1.legend(loc='upper left', fontsize=9)
+        ax1.grid(True, alpha=0.3)
+        
+        # Нижний график: ошибка прогноза
+        ax2.plot(timestamps_plot, error, 'purple', linewidth=1)
+        ax2.fill_between(timestamps_plot, 0, error, 
+                        where=(error > 0), color='red', alpha=0.4, label='Переоценка')
+        ax2.fill_between(timestamps_plot, 0, error, 
+                        where=(error <= 0), color='green', alpha=0.4, label='Недооценка')
+        
+        ax2.set_title("Ошибка прогноза", fontsize=12, fontweight='bold')
+        ax2.set_xlabel("Время", fontsize=10)
+        ax2.set_ylabel("Ошибка (°C)", fontsize=10)
+        ax2.legend(loc='upper right', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        
+        plt.tight_layout()
+        
+        # Сохраняем через ExperimentManager
+        save_name = f"detailed_forecast_h{horizon}d_{dataset_name}_{best_model_name.replace(' ', '_')}"
+        manager.save_plot(fig, f"{save_name}.png")
+        print(f"    ✓ График сохранён: {save_name}.png")
+        
+        plt.close()
+        
+    except Exception as e:
+        print(f"    ⚠️  Ошибка при создании детального графика: {e}")
 
 
 def compute_multi_horizon_curve(df: pd.DataFrame, config: Dict, 
                                 dataset_name: str, manager: ExperimentManager,
                                 progress: ProgressTracker = None) -> Dict[str, Any]:
-    """Вычисление multi-horizon кривой ошибки + AUC."""
+    """
+    Вычисление multi-horizon кривой ошибки + AUC.
+    
+    Для каждой точки на кривой:
+    1. Оценивает ВСЕ модели
+    2. Выбирает лучшую
+    3. Создаёт детальный график для лучшей модели
+    """
     n_samples = len(df)
     
     # Горизонты для AUC кривой
@@ -595,13 +687,17 @@ def compute_multi_horizon_curve(df: pd.DataFrame, config: Dict,
         "horizons": horizons.tolist(),
         "horizons_relative": [h / n_samples for h in horizons],
         "models": {},
-        "best_per_horizon": {}
+        "best_per_horizon": {}  # ← НОВОЕ: лучшая модель для каждого горизонта
     }
     
-    # ← ИСПОЛЬЗУЕМ СПИСОК ИЗ КОНФИГА
-    models_to_evaluate = config.get("models_to_compare", [
-        "naive", "rf_base", "rf_auto_fe", "gb_base", "gb_auto_fe"
-    ])
+    # Все модели для сравнения
+    models_to_evaluate = [
+        "naive", "rf_base", "rf_auto_fe", 
+        "gb_base", "gb_auto_fe"
+    ]
+    
+    if config.get("use_lstm", False) and HAS_TENSORFLOW:
+        models_to_evaluate.extend(["lstm_base", "lstm_auto_fe"])
     
     total_evaluations = len(horizons) * len(models_to_evaluate)
     
@@ -619,6 +715,20 @@ def compute_multi_horizon_curve(df: pd.DataFrame, config: Dict,
                 if model_name in results:
                     maes.append(results[model_name]["mae"])
                     r2s.append(results[model_name]["r2"])
+                    
+                    # ← НОВОЕ: Для лучшей модели на каждом горизонте создаём детальный график
+                    if h_idx == 0 and manager is not None:  # Только для первого горизонта
+                        # Находим лучшую модель
+                        best_model = min(results.items(), key=lambda x: x[1]["mae"])
+                        if best_model[0] == model_name:
+                            create_detailed_forecast_plot(
+                                y_test=pd.Series(results[model_name]["pred"]),
+                                best_pred=results[model_name]["pred"],
+                                best_model_name=model_name,
+                                horizon=h,
+                                dataset_name=dataset_name,
+                                manager=manager
+                            )
                 else:
                     maes.append(np.nan)
                     r2s.append(np.nan)
@@ -640,6 +750,7 @@ def compute_multi_horizon_curve(df: pd.DataFrame, config: Dict,
         else:
             maes_norm = maes
         
+        # AUC
         auc = compute_auc_curve(maes_norm, curves["horizons_relative"])
         
         curves["models"][model_name] = {
@@ -649,21 +760,17 @@ def compute_multi_horizon_curve(df: pd.DataFrame, config: Dict,
             "auc": auc
         }
     
-    # Определяем лучшую модель для каждого горизонта
+    # ← НОВОЕ: Определяем лучшую модель для каждого горизонта
     for h_idx, h in enumerate(horizons):
         try:
             results = evaluate_models(df, h, config, dataset_name, None)
             if results:
-                # Фильтруем только модели из списка
-                valid_results = {k: v for k, v in results.items() 
-                               if k in models_to_evaluate and not np.isnan(v.get("mae", np.nan))}
-                if valid_results:
-                    best_model = min(valid_results.items(), key=lambda x: x[1]["mae"])
-                    curves["best_per_horizon"][str(h)] = {
-                        "model": best_model[0],
-                        "mae": best_model[1]["mae"],
-                        "r2": best_model[1]["r2"]
-                    }
+                best_model = min(results.items(), key=lambda x: x[1]["mae"])
+                curves["best_per_horizon"][str(h)] = {
+                    "model": best_model[0],
+                    "mae": best_model[1]["mae"],
+                    "r2": best_model[1]["r2"]
+                }
         except:
             pass
     
@@ -683,19 +790,19 @@ def plot_mae_curves(all_curves: Dict[str, Dict], output_path: str):
     # Все модели включая базовые и LSTM
     models = ["naive", "rf_base", "rf_auto_fe", "gb_base", "gb_auto_fe"]
     if any("lstm" in str(curves["models"]) for curves in all_curves.values()):
-        models.extend(["lstm_base"])
+        models.extend(["lstm_base", "lstm_auto_fe"])
     
     colors = {
         "naive": "gray",
         "rf_base": "steelblue", "rf_auto_fe": "darkblue",
         "gb_base": "green", "gb_auto_fe": "darkgreen",
-        "lstm_base": "orange"
+        "lstm_base": "orange", "lstm_auto_fe": "darkorange"
     }
     labels = {
         "naive": "Наивный",
         "rf_base": "RF базовая", "rf_auto_fe": "RF + Auto FE",
         "gb_base": "GB базовая", "gb_auto_fe": "GB + Auto FE",
-        "lstm_base": "LSTM базовая"
+        "lstm_base": "LSTM базовая", "lstm_auto_fe": "LSTM + Auto FE"
     }
     
     # 1. Кривые MAE по датасетам
@@ -827,28 +934,29 @@ def main():
     print_section_header("🔬 СРАВНИТЕЛЬНЫЙ АНАЛИЗ: Multi-dataset, Multi-horizon, Multi-model")
     
     start_time = datetime.now()
-    print(f" Время запуска: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⏰ Время запуска: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Инициализация ExperimentManager
     manager = ExperimentManager(experiment_type="comparison")
     
-    print(f"\n Результаты: {manager.full_dir}/")
-    print(f" JSON-отчёты: {manager.full_dir}/{COMPARISON_CONFIG['json_subdir']}/")
-    print(f" Графики: {manager.full_dir}/{COMPARISON_CONFIG['plots_subdir']}/")
+    print(f"\n📁 Результаты: {manager.full_dir}/")
+    print(f"📄 JSON-отчёты: {manager.full_dir}/{COMPARISON_CONFIG['json_subdir']}/")
+    print(f"📊 Графики: {manager.full_dir}/{COMPARISON_CONFIG['plots_subdir']}/")
     
     if not HAS_TENSORFLOW:
-        print("\n    TensorFlow не установлен. LSTM модели будут пропущены.")
+        print("\n  ⚠️  TensorFlow не установлен. LSTM модели будут пропущены.")
     
     # Вычисляем общее количество задач для прогресса
     n_datasets = len(DATASET_CONFIGS)
     n_points = COMPARISON_CONFIG["auc_n_points"]
-    n_models = len(COMPARISON_CONFIG.get("models_to_compare", []))
+    n_models = 7 if (COMPARISON_CONFIG.get("use_lstm", False) and HAS_TENSORFLOW) else 5
     total_tasks = n_datasets * n_points * n_models
     
-    print(f"\n План выполнения:")
+    print(f"\n📊 План выполнения:")
     print(f"   • Датасетов: {n_datasets}")
     print(f"   • Точек на кривой: {n_points}")
-    print(f"   • Моделей на точку: {n_models} ({', '.join(COMPARISON_CONFIG.get('models_to_compare', []))})")
+    print(f"   • Моделей на точку: {n_models} (Naive, RF base/auto FE, GB base/auto FE" + 
+          (", LSTM base/auto FE" if COMPARISON_CONFIG.get("use_lstm", False) else "") + ")")
     print(f"   • Всего оценок моделей: {total_tasks:,}")
     print(f"   • Ориентировочное время: ~{total_tasks * 2 / 60:.0f}-{total_tasks * 5 / 60:.0f} минут")
     
@@ -864,18 +972,18 @@ def main():
     progress = ProgressTracker(total_tasks, "Общий прогресс")
     
     for ds_idx, (ds_name, ds_config) in enumerate(DATASET_CONFIGS.items(), 1):
-        print_subsection(f"[{ds_idx}/{n_datasets}] {ds_name}: {ds_config['description']}")
+        print_subsection(f"📊 [{ds_idx}/{n_datasets}] {ds_name}: {ds_config['description']}")
         
         try:
             # Загрузка
             df = load_dataset(ds_name, ds_config)
             
             if len(df) < 100:
-                print(f"      Слишком мало данных ({len(df)}), пропускаем")
+                print(f"    ⚠️  Слишком мало данных ({len(df)}), пропускаем")
                 continue
             
             # Вычисление multi-horizon кривой
-            print(f"\n     Вычисление кривых ({COMPARISON_CONFIG['auc_n_points']} точек)...")
+            print(f"\n    🔄 Вычисление кривых ({COMPARISON_CONFIG['auc_n_points']} точек)...")
             curves = compute_multi_horizon_curve(
                 df, COMPARISON_CONFIG, ds_name, manager, progress
             )
@@ -893,7 +1001,7 @@ def main():
                      if not np.isnan(m.get("auc", np.nan))),
                     default=np.nan
                 ),
-                "best_per_horizon": curves.get("best_per_horizon", {})
+                "best_per_horizon": curves.get("best_per_horizon", {})  # ← НОВОЕ
             }
             all_summaries[ds_name] = summary
             
@@ -906,16 +1014,16 @@ def main():
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
             
-            print(f"\n     AUC: {summary['best_auc']:.4f} (лучшая модель)")
+            print(f"\n    ✅ AUC: {summary['best_auc']:.4f} (лучшая модель)")
             
-            # Вывод лучшей модели для каждого горизонта
+            # ← НОВОЕ: Вывод лучшей модели для каждого горизонта
             if curves.get("best_per_horizon"):
-                print(f"\n     Лучшие модели по горизонтам:")
+                print(f"\n    🏆 Лучшие модели по горизонтам:")
                 for h, best in curves["best_per_horizon"].items():
                     print(f"       Горизонт {h}: {best['model']} (MAE={best['mae']:.3f}, R²={best['r2']:.3f})")
             
         except Exception as e:
-            print(f"     Ошибка: {e}")
+            print(f"    ❌ Ошибка: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -924,7 +1032,7 @@ def main():
     progress.finish()
     
     if not all_curves:
-        print("\n Нет данных для построения графиков!")
+        print("\n❌ Нет данных для построения графиков!")
         return
     
     # ========================================================================
@@ -947,7 +1055,7 @@ def main():
         os.path.join(plots_dir, "auc_comparison.png")
     )
     
-    print(f"\n  Все графики сохранены в {plots_dir}/")
+    print(f"\n  ✅ Все графики сохранены в {plots_dir}/")
     
     # ========================================================================
     # 3. Сводный отчёт
@@ -1010,8 +1118,8 @@ def main():
     else:
         duration_str = f"{int(duration/3600)}ч {int((duration%3600)/60)}м"
     
-    print(f"\n  Длительность: {duration_str} ({duration/60:.1f} минут)")
-    print(f" Сводный отчёт: {summary_path}")
+    print(f"\n⏱️  Длительность: {duration_str} ({duration/60:.1f} минут)")
+    print(f"📁 Сводный отчёт: {summary_path}")
     
     # Ключевой инсайт
     print_section_header("🔑 КЛЮЧЕВОЙ ИНСАЙТ", "=")
@@ -1023,11 +1131,11 @@ def main():
             key=lambda x: x[1],
             default=("N/A", np.nan)
         )
-        print(f"\n Наилучшая предсказуемость: {best_overall[0]} (AUC={best_overall[1]:.4f})")
+        print(f"\n🏆 Наилучшая предсказуемость: {best_overall[0]} (AUC={best_overall[1]:.4f})")
         print(f"   → Меньшее AUC = более пологая кривая роста ошибки")
         print(f"   → Датасет лучше поддаётся прогнозу на длинных горизонтах")
     
-    print_section_header("Сравнительный анализ завершён!", "=")
+    print_section_header("✅ Сравнительный анализ завершён!", "=")
 
 
 if __name__ == "__main__":
