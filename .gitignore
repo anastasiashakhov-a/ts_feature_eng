@@ -50,6 +50,7 @@ test_report.txt
 
 # # Data
 /results
+/test_results
 /*.png
 # data/
 # *.csv
