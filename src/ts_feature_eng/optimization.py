@@ -1,5 +1,4 @@
 # src/ts_feature_eng/optimization.py
-# src/ts_feature_eng/optimization.py
 """
 Байесовская оптимизация выбора методов инженерии признаков для временных рядов.
 
@@ -12,6 +11,7 @@
 - Anti-trivial penalty против доминирования одного признака
 - Naive similarity penalty против копирования y(t-1)
 - Entropy-based diversity bonus за разнообразие признаков
+- SHAP-based diversity bonus за разнообразие вкладов признаков
 - Иерархический search space с авто-режимами пайплайна
 - Early abort для ускорения поиска
 """
@@ -46,7 +46,12 @@ class OptimizerConfig:
     # Штрафы (чем больше — тем строже)
     dominance_lambda: float = 0.5      # Штраф за доминирование одного признака
     naive_lambda: float = 0.3          # Штраф за копирование lag_1
-    entropy_lambda: float = 0.1        # Бонус за разнообразие признаков
+    entropy_lambda: float = 0.1        # Бонус за разнообразие признаков по группам
+    
+    # SHAP-based diversity bonus
+    shap_diversity_lambda: float = 0.15  # Бонус за разнообразие SHAP-вкладов
+    shap_sample_size: int = 100          # Размер выборки для SHAP (скорость vs точность)
+    shap_similarity_threshold: float = 0.8  # Порог схожести SHAP-паттернов
     
     # Пороги
     dominance_threshold: float = 0.7   # Макс. доля важности одного признака
@@ -81,20 +86,16 @@ class FeatureEngineeringPipeline:
         self.is_fitted_ = False
 
     def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Optional[Union[pd.Series, np.ndarray]] = None) -> "FeatureEngineeringPipeline":
-        """
-        Последовательное обучение всех активных трансформеров в пайплайне.
-        """
+        """Последовательное обучение всех активных трансформеров в пайплайне."""
         X_current = X
         all_feature_names = []
         for name, transformer, active in self.transformers:
             if not active:
                 continue
-            # Для трансформеров, требующих целевую переменную
             if isinstance(transformer, TimeEncodingTransformer) and transformer.fit_params:
                 transformer.fit(X_current, y)
             else:
                 transformer.fit(X_current)
-            # Сохраняем имена признаков
             if hasattr(transformer, "get_feature_names"):
                 all_feature_names.extend(transformer.get_feature_names())
         self.feature_names_ = all_feature_names
@@ -102,9 +103,7 @@ class FeatureEngineeringPipeline:
         return self
 
     def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
-        """
-        Применение всех активных трансформеров к данным.
-        """
+        """Применение всех активных трансформеров к данным."""
         if not self.is_fitted_:
             raise ValueError("Pipeline is not fitted. Call fit() first.")
         
@@ -132,6 +131,154 @@ class FeatureEngineeringPipeline:
 
 
 # ============================================================================
+# SHAP-BASED DIVERSITY CALCULATOR
+# ============================================================================
+class SHAPDiversityCalculator:
+    """
+    Вычислитель разнообразия признаков на основе SHAP-значений.
+    
+    Основная идея: признаки с разными паттернами влияния на прогноз
+    считаются более ценными, чем признаки с похожими вкладами.
+    """
+    
+    def __init__(self, sample_size: int = 100, random_state: Optional[int] = None):
+        self.sample_size = sample_size
+        self.random_state = random_state
+    
+    def compute_shap_matrix(self, model: BaseEstimator, X: pd.DataFrame) -> Optional[np.ndarray]:
+        """
+        Вычисление матрицы SHAP-значений.
+        
+        Returns:
+            np.ndarray: матрица [n_samples, n_features] с SHAP-значениями
+            или None если SHAP недоступен
+        """
+        try:
+            import shap
+        except ImportError:
+            return None
+        
+        # Сэмплируем данные для скорости
+        n_samples = min(self.sample_size, len(X))
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+        sample_idx = np.random.choice(len(X), size=n_samples, replace=False)
+        X_sample = X.iloc[sample_idx].fillna(0)
+        
+        try:
+            # Пытаемся использовать TreeExplainer для tree-based моделей
+            if hasattr(model, 'feature_importances_') or 'tree' in model.__class__.__name__.lower():
+                explainer = shap.TreeExplainer(model)
+            else:
+                # Для других моделей используем KernelExplainer (медленнее)
+                explainer = shap.KernelExplainer(model.predict, X_sample.iloc[:50])
+            
+            shap_values = explainer.shap_values(X_sample)
+            
+            # Обработка разных форматов вывода SHAP
+            if isinstance(shap_values, list):
+                # Для мультиклассовой классификации берём первый класс
+                shap_values = shap_values[0]
+            
+            if isinstance(shap_values, tuple):
+                # Некоторые explainer возвращают (values, data)
+                shap_values = shap_values[0]
+            
+            return np.abs(shap_values)  # Абсолютные значения для анализа вклада
+            
+        except Exception as e:
+            # Если SHAP не сработал — возвращаем None
+            return None
+    
+    def compute_feature_similarity(self, shap_matrix: np.ndarray, 
+                                  feature_names: List[str]) -> np.ndarray:
+        """
+        Вычисление матрицы попарной схожести признаков по SHAP-паттернам.
+        
+        Returns:
+            np.ndarray: матрица [n_features, n_features] с корреляциями
+        """
+        n_features = shap_matrix.shape[1]
+        similarity_matrix = np.zeros((n_features, n_features))
+        
+        for i in range(n_features):
+            for j in range(i, n_features):
+                if i == j:
+                    similarity_matrix[i, j] = 1.0
+                else:
+                    # Корреляция Пирсона между SHAP-паттернами
+                    corr = np.corrcoef(shap_matrix[:, i], shap_matrix[:, j])[0, 1]
+                    # Преобразуем корреляцию в схожесть [0, 1]
+                    similarity = np.abs(corr) if not np.isnan(corr) else 0.0
+                    similarity_matrix[i, j] = similarity
+                    similarity_matrix[j, i] = similarity
+        
+        return similarity_matrix
+    
+    def compute_diversity_score(self, shap_matrix: np.ndarray, 
+                                feature_names: List[str],
+                                threshold: float = 0.8) -> float:
+        """
+        Вычисление общего score разнообразия признаков.
+        
+        Формула:
+            diversity = 1 - (доля пар признаков со схожестью > threshold)
+        
+        Returns:
+            float: score в диапазоне [0, 1], где 1 = максимально разнообразно
+        """
+        if shap_matrix is None or len(feature_names) < 2:
+            return 0.0
+        
+        similarity_matrix = self.compute_feature_similarity(shap_matrix, feature_names)
+        n_features = len(feature_names)
+        
+        # Считаем долю пар со схожестью выше порога
+        high_similarity_pairs = 0
+        total_pairs = 0
+        
+        for i in range(n_features):
+            for j in range(i + 1, n_features):
+                total_pairs += 1
+                if similarity_matrix[i, j] > threshold:
+                    high_similarity_pairs += 1
+        
+        if total_pairs == 0:
+            return 1.0
+        
+        redundancy_ratio = high_similarity_pairs / total_pairs
+        diversity_score = 1.0 - redundancy_ratio
+        
+        return diversity_score
+    
+    def get_redundant_features(self, shap_matrix: np.ndarray,
+                               feature_names: List[str],
+                               threshold: float = 0.8) -> List[Tuple[str, str, float]]:
+        """
+        Получение списка избыточных пар признаков.
+        
+        Returns:
+            List[Tuple[str, str, float]]: список (feature1, feature2, similarity)
+        """
+        if shap_matrix is None or len(feature_names) < 2:
+            return []
+        
+        similarity_matrix = self.compute_feature_similarity(shap_matrix, feature_names)
+        redundant_pairs = []
+        
+        for i in range(len(feature_names)):
+            for j in range(i + 1, len(feature_names)):
+                if similarity_matrix[i, j] > threshold:
+                    redundant_pairs.append((
+                        feature_names[i],
+                        feature_names[j],
+                        similarity_matrix[i, j]
+                    ))
+        
+        return redundant_pairs
+
+
+# ============================================================================
 # ОПТИМИЗАТОР С MULTI-OBJECTIVE ПОДДЕРЖКОЙ
 # ============================================================================
 class FeatureEngineeringOptimizer:
@@ -145,6 +292,7 @@ class FeatureEngineeringOptimizer:
     Новые возможности:
     - Multi-objective оптимизация: MAE + diversity - triviality
     - Индуктивные смещения через штрафы, а не hard rules
+    - ← НОВОЕ: SHAP-based diversity bonus за разнообразие вкладов
     - Иерархический search space с авто-режимами
     """
 
@@ -171,6 +319,12 @@ class FeatureEngineeringOptimizer:
         self.verbose = verbose
         self.config = config or OptimizerConfig()
         
+        # ← НОВОЕ: Инициализация SHAP diversity calculator
+        self.shap_calculator = SHAPDiversityCalculator(
+            sample_size=self.config.shap_sample_size,
+            random_state=random_state
+        )
+        
         self.best_params_ = None
         self.best_score_ = -np.inf
         self.search_space_ = None
@@ -180,11 +334,7 @@ class FeatureEngineeringOptimizer:
     # 1. ANTI-TRIVIAL PENALTY (DOMINANCE)
     # =========================================================================
     def _dominance_penalty(self, model: BaseEstimator, feature_names: List[str]) -> float:
-        """
-        Штраф за доминирование одного признака.
-        
-        Если один признак имеет >70% важности — пайплайн слишком "тривиален".
-        """
+        """Штраф за доминирование одного признака."""
         if not hasattr(model, "feature_importances_"):
             return 0.0
         
@@ -192,11 +342,9 @@ class FeatureEngineeringOptimizer:
         if len(importances) == 0 or importances.sum() == 0:
             return 0.0
         
-        # Нормализуем важности
         importances = importances / importances.sum()
         max_share = importances.max()
         
-        # Штраф если один признак доминирует
         if max_share > self.config.dominance_threshold:
             penalty = (max_share - self.config.dominance_threshold) * self.config.dominance_lambda
             return penalty
@@ -206,12 +354,7 @@ class FeatureEngineeringOptimizer:
     # 2. NAIVE SIMILARITY PENALTY (LAG-COPY DETECTION)
     # =========================================================================
     def _naive_similarity_penalty(self, y_pred: np.ndarray, y_lag1: np.ndarray) -> float:
-        """
-        Штраф за слишком похожие на lag_1 прогнозы.
-        
-        Если прогноз ≈ y(t-1), значит модель просто копирует прошлое.
-        """
-        # Удаляем NaN для корреляции
+        """Штраф за слишком похожие на lag_1 прогнозы."""
         mask = ~np.isnan(y_pred) & ~np.isnan(y_lag1)
         if mask.sum() < 10:
             return 0.0
@@ -219,7 +362,6 @@ class FeatureEngineeringOptimizer:
         y_pred_clean = y_pred[mask]
         y_lag1_clean = y_lag1[mask]
         
-        # Корреляция Пирсона
         if np.std(y_pred_clean) < 1e-6 or np.std(y_lag1_clean) < 1e-6:
             return 0.0
         
@@ -227,63 +369,93 @@ class FeatureEngineeringOptimizer:
         if np.isnan(corr):
             return 0.0
         
-        # Штраф если слишком похожи
         if corr > self.config.naive_corr_threshold:
             penalty = (corr - self.config.naive_corr_threshold) * self.config.naive_lambda
             return penalty
         return 0.0
 
     # =========================================================================
-    # 3. ENTROPY-BASED DIVERSITY BONUS
+    # 3. ENTROPY-BASED DIVERSITY BONUS (BY GROUPS)
     # =========================================================================
     def _feature_group_entropy(self, feature_names: List[str]) -> float:
-        """
-        Вычисление энтропии распределения признаков по группам.
-        
-        Высокая энтропия = разнообразие = хорошо.
-        """
+        """Вычисление энтропии распределения признаков по группам."""
         if not feature_names:
             return 0.0
         
-        # Группируем по первому уровню имени (transformer name)
         groups = [name.split(".")[0] for name in feature_names]
         counts = Counter(groups)
         
         if len(counts) <= 1:
             return 0.0
         
-        # Вычисляем энтропию Шеннона
         total = sum(counts.values())
         probs = np.array([count / total for count in counts.values()])
         entropy = -np.sum(probs * np.log(probs + 1e-9))
         
-        # Нормализуем к [0, 1]
         max_entropy = np.log(len(counts))
         return entropy / max_entropy if max_entropy > 0 else 0.0
 
     # =========================================================================
-    # 4. HIERARCHICAL SEARCH SPACE (PIPELINE MODES)
+    # ← НОВОЕ: 4. SHAP-BASED DIVERSITY BONUS
+    # =========================================================================
+    def _shap_diversity_bonus(self, model: BaseEstimator, X: pd.DataFrame, 
+                              feature_names: List[str]) -> float:
+        """
+        Вычисление бонуса за разнообразие на основе SHAP-значений.
+        
+        Признаки с разными паттернами влияния на прогноз получают бонус.
+        Признаки с похожими SHAP-паттернами считаются избыточными.
+        
+        Returns:
+            float: бонус в диапазоне [0, config.shap_diversity_lambda]
+        """
+        # Вычисляем SHAP-матрицу
+        shap_matrix = self.shap_calculator.compute_shap_matrix(model, X)
+        
+        if shap_matrix is None:
+            # Если SHAP недоступен — возвращаем 0 (нейтрально)
+            return 0.0
+        
+        # Вычисляем diversity score
+        diversity_score = self.shap_calculator.compute_diversity_score(
+            shap_matrix, 
+            feature_names,
+            threshold=self.config.shap_similarity_threshold
+        )
+        
+        # Возвращаем бонус (умножаем на lambda для масштабирования)
+        return diversity_score * self.config.shap_diversity_lambda
+
+    def _get_shap_redundant_pairs(self, model: BaseEstimator, X: pd.DataFrame,
+                                   feature_names: List[str]) -> List[Tuple[str, str, float]]:
+        """
+        Получение списка избыточных пар признаков по SHAP.
+        Полезно для отладки и интерпретации.
+        """
+        shap_matrix = self.shap_calculator.compute_shap_matrix(model, X)
+        if shap_matrix is None:
+            return []
+        
+        return self.shap_calculator.get_redundant_features(
+            shap_matrix,
+            feature_names,
+            threshold=self.config.shap_similarity_threshold
+        )
+
+    # =========================================================================
+    # 5. HIERARCHICAL SEARCH SPACE (PIPELINE MODES)
     # =========================================================================
     def _define_search_space(self, meta_features: Optional[Dict[str, float]] = None) -> List:
-        """
-        Определение пространства поиска с поддержкой pipeline modes.
-        """
+        """Определение пространства поиска с поддержкой pipeline modes."""
         space = []
         
-        # режим пайплайна
-        space.append(Categorical(
-            list(self.config.pipeline_modes.keys()),
-            name="pipeline_mode"
-        ))
-        
-        # 1. Категориальные параметры (всегда доступны)
+        space.append(Categorical(list(self.config.pipeline_modes.keys()), name="pipeline_mode"))
         space.append(Categorical([True, False], name="use_window"))
         space.append(Categorical([True, False], name="use_dwt"))
         space.append(Categorical([True, False], name="use_stl"))
         space.append(Categorical([True, False], name="use_time_encoding"))
         space.append(Categorical([True, False], name="use_calendar_features"))
 
-        # 2. Гиперпараметры оконного трансформера
         space.append(Integer(6, 168, name="window_size"))
         space.append(Categorical(
             ["identity", "diff", "sma", "identity,diff", "identity,sma", "diff,sma", "identity,diff,sma"],
@@ -291,18 +463,15 @@ class FeatureEngineeringOptimizer:
         ))
         space.append(Integer(1, 24, name="window_min_periods"))
 
-        # 3. Гиперпараметры DWT
         space.append(Categorical(["db4", "db8", "sym4", "coif1"], name="dwt_wavelet"))
         space.append(Integer(1, 5, name="dwt_max_level"))
 
-        # 4. Гиперпараметры STL
         space.append(Integer(12, 168, name="stl_period"))
         space.append(Categorical(
             [7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31],
             name="stl_seasonal"
         ))
 
-        # 5. Гиперпараметры временного кодирования
         space.append(Categorical(["cyclic", "time2vec"], name="time_encoding_mode"))
         space.append(Categorical(
             ["hour", "day_of_week", "month", "hour,day_of_week", "hour,month", "day_of_week,month", "hour,day_of_week,month"],
@@ -310,12 +479,10 @@ class FeatureEngineeringOptimizer:
         ))
         space.append(Integer(4, 16, name="time2vec_dim"))
 
-        # 6. Бинарные флаги постобработки
         space.append(Categorical([True, False], name="apply_shap_filter"))
         space.append(Real(0.0, 0.5, name="missing_threshold"))
         space.append(Real(0.0, 0.1, name="variance_threshold"))
 
-        # Адаптация на основе мета-признаков
         if meta_features is not None and self.use_meta_features:
             self._adapt_search_space(space, meta_features)
         
@@ -333,16 +500,12 @@ class FeatureEngineeringOptimizer:
                         break
 
     def _build_pipeline(self, params: Dict[str, Any]) -> FeatureEngineeringPipeline:
-        """
-        Построение пайплайна с поддержкой pipeline modes.
-        """
+        """Построение пайплайна с поддержкой pipeline modes."""
         transformers = []
         
-        # 🔑 ОПРЕДЕЛЯЕМ АКТИВНЫЕ ГРУППЫ ПО РЕЖИМУ
         mode = params.get("pipeline_mode", "full")
         active_groups = self.config.pipeline_modes.get(mode, self.config.pipeline_modes["full"])
         
-        # WindowTransformer
         if params.get("use_window") and "window" in active_groups:
             window_size = params["window_size"]
             min_periods = min(params["window_min_periods"], window_size)
@@ -358,7 +521,6 @@ class FeatureEngineeringOptimizer:
                 True
             ))
         
-        # DWTTransformer
         if params.get("use_dwt") and "dwt" in active_groups:
             transformers.append((
                 "dwt",
@@ -370,7 +532,6 @@ class FeatureEngineeringOptimizer:
                 True
             ))
         
-        # STLTransformer
         if params.get("use_stl") and "stl" in active_groups:
             transformers.append((
                 "stl",
@@ -382,19 +543,15 @@ class FeatureEngineeringOptimizer:
                 True
             ))
         
-        # TimeEncodingTransformer
         if params.get("use_time_encoding") and "time_encoding" in active_groups:
             if params["time_encoding_mode"] == "cyclic":
                 components = params["cyclic_components"].split(",")
                 transformers.append((
                     "time_encoding",
-                    TimeEncodingTransformer(
-                        mode="cyclic",
-                        cyclic_components=components
-                    ),
+                    TimeEncodingTransformer(mode="cyclic", cyclic_components=components),
                     True
                 ))
-            else:  # time2vec
+            else:
                 transformers.append((
                     "time_encoding",
                     TimeEncodingTransformer(
@@ -405,7 +562,6 @@ class FeatureEngineeringOptimizer:
                     True
                 ))
         
-        # CalendarFeaturesTransformer
         if params.get("use_calendar_features") and "calendar" in active_groups:
             transformers.append((
                 "calendar",
@@ -417,59 +573,47 @@ class FeatureEngineeringOptimizer:
 
         if "core_lags" in active_groups or mode == "baseline":
             from .transformers.lag import LagTransformer
-            # Лаги определяются автоматически в pipeline.py
-            # Здесь просто резервируем место
             pass
         
         return FeatureEngineeringPipeline(transformers)
 
     # =========================================================================
-    # 5. EARLY ABORT FOR BAD PIPELINES
+    # 6. EARLY ABORT FOR BAD PIPELINES
     # =========================================================================
     def _early_abort_check(self, X_transformed: pd.DataFrame, dominance_penalty: float) -> Optional[float]:
-        """
-        Ранняя остановка для заведомо плохих пайплайнов.
-        
-        Возвращает штраф если нужно остановиться, иначе None.
-        """
+        """Ранняя остановка для заведомо плохих пайплайнов."""
         if not self.config.enable_early_abort:
             return None
         
-        # Слишком мало признаков
         if X_transformed.shape[1] < self.config.min_features_for_evaluation:
             return 1e5
         
-        # Слишком высокий штраф доминирования
         if dominance_penalty > self.config.early_abort_penalty:
             return 1e5
         
         return None
 
     # =========================================================================
-    # MAIN OBJECTIVE FUNCTION (MULTI-OBJECTIVE)
+    # MAIN OBJECTIVE FUNCTION (MULTI-OBJECTIVE WITH SHAP DIVERSITY)
     # =========================================================================
     def _objective(self, X: pd.DataFrame, y: pd.Series, **params) -> float:
         """
-        Целевая функция с multi-objective поддержкой.
+        Целевая функция с multi-objective поддержкой и SHAP diversity bonus.
         
         Формула:
-            final_score = MAE + dominance_penalty + naive_penalty - entropy_bonus
+            final_score = base_score + dominance_penalty + naive_penalty 
+                         - entropy_bonus - shap_diversity_bonus
         
         Возвращает значение для минимизации.
         """
         pipeline = self._build_pipeline(params)
         
         try:
-            # Генерация признаков
             X_transformed = pipeline.fit_transform(X, y)
             
-            # Базовые проверки
-            if X_transformed.shape[1] == 0:
-                return 1e6
-            if X_transformed.isna().all().all():
+            if X_transformed.shape[1] == 0 or X_transformed.isna().all().all():
                 return 1e6
 
-            # Пост-фильтрация
             if params.get("apply_shap_filter"):
                 X_transformed = self._apply_shap_filter(X_transformed, y)
             
@@ -487,12 +631,8 @@ class FeatureEngineeringOptimizer:
             
             if isinstance(self.metric, str):
                 scores = cross_val_score(
-                    self.model,
-                    X_transformed,
-                    y,
-                    cv=self.cv,
-                    scoring=self.metric,
-                    n_jobs=-1
+                    self.model, X_transformed, y,
+                    cv=self.cv, scoring=self.metric, n_jobs=-1
                 )
                 mean_score = np.mean(scores)
             else:
@@ -502,10 +642,8 @@ class FeatureEngineeringOptimizer:
                     y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
                     self.model.fit(X_train, y_train)
                     y_pred = self.model.predict(X_test)
-                    score = self.metric(y_test, y_pred)
-                    scores.append(score)
+                    scores.append(self.metric(y_test, y_pred))
                 mean_score = np.mean(scores)
-            
             
             # 1. Dominance penalty
             dominance_penalty = self._dominance_penalty(self.model, list(X_transformed.columns))
@@ -514,15 +652,19 @@ class FeatureEngineeringOptimizer:
             naive_penalty = 0.0
             lag1_col = [c for c in X_transformed.columns if "lag_1" in c and "core_lags" in c]
             if lag1_col and hasattr(self.model, "predict"):
-                # Обучаем на всех данных для получения предсказаний
                 self.model.fit(X_transformed.fillna(0), y)
                 y_pred = self.model.predict(X_transformed.fillna(0))
                 y_lag1 = X_transformed[lag1_col[0]].values
                 naive_penalty = self._naive_similarity_penalty(y_pred, y_lag1)
             
-            # 3. Entropy bonus (разнообразие)
+            # 3. Entropy bonus (разнообразие по группам)
             entropy = self._feature_group_entropy(list(X_transformed.columns))
             entropy_bonus = self.config.entropy_lambda * entropy
+            
+            # ← 4. SHAP diversity bonus (разнообразие вкладов)
+            shap_diversity_bonus = self._shap_diversity_bonus(
+                self.model, X_transformed.fillna(0), list(X_transformed.columns)
+            )
             
             # EARLY ABORT CHECK
             early_penalty = self._early_abort_check(X_transformed, dominance_penalty)
@@ -530,9 +672,7 @@ class FeatureEngineeringOptimizer:
                 return early_penalty
             
             # ФИНАЛЬНАЯ ФОРМУЛА
-            # Для метрик где больше = лучше (R², neg_MAE):
             if self.metric in ["r2", "neg_mean_absolute_error", "neg_mean_squared_error", "neg_root_mean_squared_error"]:
-                # Инвертируем score для минимизации
                 base_score = -mean_score
             else:
                 base_score = mean_score
@@ -541,7 +681,8 @@ class FeatureEngineeringOptimizer:
                 base_score
                 + dominance_penalty
                 + naive_penalty
-                - entropy_bonus  # Вычитаем бонус = уменьшаем score = лучше
+                - entropy_bonus          # Вычитаем = бонус
+                - shap_diversity_bonus   # ← Вычитаем SHAP бонус = поощряем разнообразие
             )
             
             # Сохраняем историю с расширенными метриками
@@ -551,6 +692,7 @@ class FeatureEngineeringOptimizer:
                 "dominance_penalty": dominance_penalty,
                 "naive_penalty": naive_penalty,
                 "entropy_bonus": entropy_bonus,
+                "shap_diversity_bonus": shap_diversity_bonus,  # ← НОВОЕ
                 "final_score": final_score,
                 "n_features": X_transformed.shape[1]
             })
@@ -589,16 +731,12 @@ class FeatureEngineeringOptimizer:
         y: Union[pd.Series, np.ndarray],
         meta_features: Optional[Union[Dict[str, float], pd.DataFrame]] = None
     ) -> Tuple[FeatureEngineeringPipeline, Dict[str, Any], float]:
-        """
-        Запуск байесовской оптимизации для поиска оптимального пайплайна.
-        """
-        # Валидация входных данных
+        """Запуск байесовской оптимизации для поиска оптимального пайплайна."""
         if isinstance(X, np.ndarray):
             X = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
         if isinstance(y, np.ndarray):
             y = pd.Series(y, index=X.index)
 
-        # Извлечение мета-признаков
         if meta_features is None and self.use_meta_features:
             extractor = MetaFeatureExtractor(
                 categories=["simple", "statistical", "spectral"],
@@ -609,19 +747,17 @@ class FeatureEngineeringOptimizer:
         elif isinstance(meta_features, pd.DataFrame):
             meta_features = meta_features.iloc[0].to_dict()
 
-        # Определение пространства поиска
         self.search_space_ = self._define_search_space(meta_features)
 
-        # Создание целевой функции
         @use_named_args(self.search_space_)
         def objective_function(**kwargs):
             return self._objective(X, y, **kwargs)
 
-        # Запуск оптимизации
         if self.verbose >= 1:
             print(f"Запуск байесовской оптимизации ({self.n_calls} итераций)...")
             print(f"  Режимы: {list(self.config.pipeline_modes.keys())}")
             print(f"  Штрафы: dominance={self.config.dominance_lambda}, naive={self.config.naive_lambda}")
+            print(f"  Бонусы: entropy={self.config.entropy_lambda}, shap_diversity={self.config.shap_diversity_lambda}")
 
         result = gp_minimize(
             objective_function,
@@ -632,16 +768,13 @@ class FeatureEngineeringOptimizer:
             verbose=self.verbose >= 2
         )
 
-        # Сохранение результатов
         self.best_params_ = {dim.name: result.x[i] for i, dim in enumerate(self.search_space_)}
         
-        # Инвертируем score обратно для отчёта
         if self.metric in ["neg_mean_absolute_error", "neg_mean_squared_error", "neg_root_mean_squared_error", "r2"]:
             self.best_score_ = -result.fun
         else:
             self.best_score_ = result.fun
 
-        # Построение оптимального пайплайна
         best_pipeline = self._build_pipeline(self.best_params_)
         best_pipeline.fit(X, y)
 
@@ -667,7 +800,6 @@ class FeatureEngineeringOptimizer:
         for i in range(n_points):
             point = {}
             
-            # 🔑 ВЫБИРАЕМ РЕЖИМ ПЛАЙПЛАЙНА
             if i == 0:
                 point["pipeline_mode"] = "baseline"
             elif i == 1:
@@ -699,7 +831,6 @@ class FeatureEngineeringOptimizer:
             point["missing_threshold"] = 0.2
             point["variance_threshold"] = 0.01
             
-            # Небольшая вариация для exploration
             point["window_size"] = max(6, min(168, point["window_size"] + np.random.randint(-6, 7)))
             
             points.append(point)
