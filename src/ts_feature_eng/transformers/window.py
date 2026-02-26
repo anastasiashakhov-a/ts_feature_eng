@@ -5,9 +5,15 @@
 
 Предоставляет WindowTransformer — универсальный трансформер для генерации
 оконных статистик, разностных преобразований и лагов на основе скользящих окон.
+
+Исправления (v2.1):
+- Добавлена безопасная обработка статистик (skewness, kurtosis)
+- Обработка окон с недостаточным количеством данных
+- Подавление предупреждений о потере точности
 """
 
 from typing import List, Optional, Union, Dict, Any
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -15,6 +21,148 @@ from scipy import stats
 
 from ..base import TimeSeriesTransformer
 
+
+# ============================================================================
+# БЕЗОПАСНЫЕ ФУНКЦИИ ДЛЯ СТАТИСТИК
+# ============================================================================
+
+def safe_skew(x, nan_policy='omit'):
+    """
+    Безопасное вычисление асимметрии с обработкой ошибок.
+    
+    Возвращает NaN если:
+    - Недостаточно данных (< 3 точек)
+    - Все значения одинаковы (нулевая дисперсия)
+    - Есть NaN после обработки
+    """
+    try:
+        # Удаляем NaN
+        x_clean = np.asarray(x)
+        if nan_policy == 'omit':
+            x_clean = x_clean[~np.isnan(x_clean)]
+        
+        # Проверка на достаточное количество данных
+        if len(x_clean) < 3:
+            return np.nan
+        
+        # Проверка на нулевую дисперсию
+        if np.std(x_clean) < 1e-10:
+            return np.nan
+        
+        result = stats.skew(x_clean, nan_policy='omit')
+        
+        # Проверка на валидность результата
+        if np.isnan(result) or np.isinf(result):
+            return np.nan
+        
+        return result
+    except Exception:
+        return np.nan
+
+
+def safe_kurtosis(x, nan_policy='omit'):
+    """
+    Безопасное вычисление эксцесса с обработкой ошибок.
+    
+    Возвращает NaN если:
+    - Недостаточно данных (< 4 точек)
+    - Все значения одинаковы (нулевая дисперсия)
+    - Есть NaN после обработки
+    """
+    try:
+        # Удаляем NaN
+        x_clean = np.asarray(x)
+        if nan_policy == 'omit':
+            x_clean = x_clean[~np.isnan(x_clean)]
+        
+        # Проверка на достаточное количество данных
+        if len(x_clean) < 4:
+            return np.nan
+        
+        # Проверка на нулевую дисперсию
+        if np.std(x_clean) < 1e-10:
+            return np.nan
+        
+        result = stats.kurtosis(x_clean, nan_policy='omit')
+        
+        # Проверка на валидность результата
+        if np.isnan(result) or np.isinf(result):
+            return np.nan
+        
+        return result
+    except Exception:
+        return np.nan
+
+
+def safe_slope(x):
+    """
+    Безопасное вычисление наклона линейной регрессии.
+    
+    Возвращает NaN если:
+    - Недостаточно данных (< 2 точек)
+    - Все значения одинаковы
+    """
+    try:
+        x_clean = np.asarray(x)
+        mask = ~np.isnan(x_clean)
+        
+        if np.sum(mask) < 2:
+            return np.nan
+        
+        x_vals = x_clean[mask]
+        
+        # Проверка на нулевую дисперсию
+        if np.std(x_vals) < 1e-10:
+            return np.nan
+        
+        indices = np.arange(len(x_clean))[mask]
+        slope, _ = np.polyfit(indices, x_vals, 1)
+        
+        if np.isnan(slope) or np.isinf(slope):
+            return np.nan
+        
+        return slope
+    except Exception:
+        return np.nan
+
+
+def safe_acf1(x):
+    """
+    Безопасное вычисление автокорреляции первого порядка.
+    
+    Возвращает NaN если:
+    - Недостаточно данных (< 3 точек)
+    - Нулевая дисперсия
+    """
+    try:
+        x_clean = np.asarray(x)
+        mask = ~np.isnan(x_clean)
+        
+        if np.sum(mask) < 3:
+            return np.nan
+        
+        x_vals = x_clean[mask]
+        
+        # Проверка на нулевую дисперсию
+        if np.std(x_vals) < 1e-10:
+            return np.nan
+        
+        if len(x_vals) < 2:
+            return np.nan
+        
+        corr = np.corrcoef(x_vals[:-1], x_vals[1:])[0, 1]
+        
+        if np.isnan(corr) or np.isinf(corr):
+            return np.nan
+        
+        return corr
+    except Exception:
+        return np.nan
+
+
+# ============================================================================
+# WINDOW TRANSFORMER
+# ============================================================================
 
 class WindowTransformer(TimeSeriesTransformer):
     """
@@ -231,61 +379,70 @@ class WindowTransformer(TimeSeriesTransformer):
         # Создаем словарь для результатов
         transformed_features = {}
         
-        # Обрабатываем каждый признак
-        for i, feature_name in enumerate(self.feature_names_in_):
-            feature_series = (
-                X_validated.iloc[:, i] 
-                if isinstance(X_validated, pd.DataFrame) 
-                else X_validated[:, i]
-            )
+        # Подавляем предупреждения для статистик
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            warnings.simplefilter("ignore", category=UserWarning)
             
-            # Применяем преобразования
-            transformed_series = {}
-            for transform in self.transformations_:
-                if transform == "identity":
-                    transformed_series[transform] = feature_series
-                elif transform == "diff":
-                    transformed_series[transform] = feature_series.diff()
-                elif transform == "pct_change":
-                    transformed_series[transform] = feature_series.pct_change()
-                elif transform == "sma":
-                    transformed_series[transform] = feature_series.rolling(
-                        window=self.window_size_, 
-                        min_periods=self.min_periods
-                    ).mean()
-            
-            # Вычисляем статистики для каждого преобразования
-            for transform, series in transformed_series.items():
-                windowed = series.rolling(window=self.window_size_, min_periods=self.min_periods)
+            # Обрабатываем каждый признак
+            for i, feature_name in enumerate(self.feature_names_in_):
+                feature_series = (
+                    X_validated.iloc[:, i] 
+                    if isinstance(X_validated, pd.DataFrame) 
+                    else X_validated[:, i]
+                )
                 
-                for stat in self.base_statistics:
-                    feature_key = f"{feature_name}.{transform}.{stat}"
+                # Применяем преобразования
+                transformed_series = {}
+                for transform in self.transformations_:
+                    if transform == "identity":
+                        transformed_series[transform] = feature_series
+                    elif transform == "diff":
+                        transformed_series[transform] = feature_series.diff()
+                    elif transform == "pct_change":
+                        transformed_series[transform] = feature_series.pct_change()
+                    elif transform == "sma":
+                        transformed_series[transform] = feature_series.rolling(
+                            window=self.window_size_, 
+                            min_periods=self.min_periods
+                        ).mean()
+                
+                # Вычисляем статистики для каждого преобразования
+                for transform, series in transformed_series.items():
+                    windowed = series.rolling(window=self.window_size_, min_periods=self.min_periods)
                     
-                    if stat == "mean":
-                        transformed_features[feature_key] = windowed.mean()
-                    elif stat == "std":
-                        transformed_features[feature_key] = windowed.std()
-                    elif stat == "min":
-                        transformed_features[feature_key] = windowed.min()
-                    elif stat == "max":
-                        transformed_features[feature_key] = windowed.max()
-                    elif stat == "slope":
-                        transformed_features[feature_key] = self._compute_slope(series, self.window_size_)
-                    elif stat == "acf1":
-                        transformed_features[feature_key] = self._compute_acf1(series, self.window_size_)
-                    elif stat == "skewness":
-                        transformed_features[feature_key] = windowed.apply(
-                            lambda x: stats.skew(x, nan_policy='omit'), raw=False
-                        )
-                    elif stat == "kurtosis":
-                        transformed_features[feature_key] = windowed.apply(
-                            lambda x: stats.kurtosis(x, nan_policy='omit'), raw=False
-                        )
-            
-            # Добавляем лаги
-            for lag in self.lag_statistics:
-                lag_key = f"{feature_name}.lag_{lag}"
-                transformed_features[lag_key] = feature_series.shift(lag)
+                    for stat in self.base_statistics:
+                        feature_key = f"{feature_name}.{transform}.{stat}"
+                        
+                        if stat == "mean":
+                            transformed_features[feature_key] = windowed.mean()
+                        elif stat == "std":
+                            transformed_features[feature_key] = windowed.std()
+                        elif stat == "min":
+                            transformed_features[feature_key] = windowed.min()
+                        elif stat == "max":
+                            transformed_features[feature_key] = windowed.max()
+                        elif stat == "slope":
+                            # ← ИСПОЛЬЗУЕМ БЕЗОПАСНУЮ ФУНКЦИЮ
+                            transformed_features[feature_key] = self._compute_slope_safe(series, self.window_size_)
+                        elif stat == "acf1":
+                            # ← ИСПОЛЬЗУЕМ БЕЗОПАСНУЮ ФУНКЦИЮ
+                            transformed_features[feature_key] = self._compute_acf1_safe(series, self.window_size_)
+                        elif stat == "skewness":
+                            # ← ИСПОЛЬЗУЕМ БЕЗОПАСНУЮ ФУНКЦИЮ
+                            transformed_features[feature_key] = windowed.apply(
+                                lambda x: safe_skew(x, nan_policy='omit'), raw=False
+                            )
+                        elif stat == "kurtosis":
+                            # ← ИСПОЛЬЗУЕМ БЕЗОПАСНУЮ ФУНКЦИЮ
+                            transformed_features[feature_key] = windowed.apply(
+                                lambda x: safe_kurtosis(x, nan_policy='omit'), raw=False
+                            )
+                
+                # Добавляем лаги
+                for lag in self.lag_statistics:
+                    lag_key = f"{feature_name}.lag_{lag}"
+                    transformed_features[lag_key] = feature_series.shift(lag)
         
         # Создаем итоговый DataFrame
         X_transformed = pd.DataFrame(transformed_features, index=X_validated.index)
@@ -314,51 +471,22 @@ class WindowTransformer(TimeSeriesTransformer):
         """
         return self.fit(X, y).transform(X)
     
-    def get_feature_names_out(self, input_features: Optional[List[str]] = None) -> List[str]:
+    def _compute_slope_safe(self, series: pd.Series, window_size: int) -> pd.Series:
         """
-        Получение имен выходных признаков.
-        
-        Параметры
-        ----------
-        input_features : List[str], опционально
-            Имена входных признаков (игнорируются, используются сохраненные имена).
-        
-        Возвращает
-        ----------
-        feature_names : List[str]
-            Список имен сгенерированных признаков.
+        Безопасное вычисление наклона линейной регрессии в скользящем окне.
+        ← ИСПОЛЬЗУЕТ safe_slope() вместо прямой реализации
         """
-        if not hasattr(self, 'feature_names_'):
-            raise ValueError("WindowTransformer has not been fitted. Call fit() first.")
-        
-        return self.feature_names_.copy()
-    
-    def _compute_slope(self, series: pd.Series, window_size: int) -> pd.Series:
-        """Вычисление наклона линейной регрессии в скользящем окне."""
-        def slope_func(window):
-            if len(window.dropna()) < 2:
-                return np.nan
-            x = np.arange(len(window))
-            y = window.values
-            mask = ~np.isnan(y)
-            if sum(mask) < 2:
-                return np.nan
-            slope, _ = np.polyfit(x[mask], y[mask], 1)
-            return slope
-        
         return series.rolling(window=window_size, min_periods=self.min_periods).apply(
-            slope_func, raw=False
+            safe_slope, raw=False
         )
     
-    def _compute_acf1(self, series: pd.Series, window_size: int) -> pd.Series:
-        """Вычисление автокорреляции первого порядка в скользящем окне."""
-        def acf1_func(window):
-            if len(window.dropna()) < 2:
-                return np.nan
-            return np.corrcoef(window[:-1], window[1:])[0, 1] if len(window) > 1 else np.nan
-        
+    def _compute_acf1_safe(self, series: pd.Series, window_size: int) -> pd.Series:
+        """
+        Безопасное вычисление автокорреляции первого порядка в скользящем окне.
+        ← ИСПОЛЬЗУЕТ safe_acf1() вместо прямой реализации
+        """
         return series.rolling(window=window_size, min_periods=self.min_periods).apply(
-            acf1_func, raw=False
+            safe_acf1, raw=False
         )
     
     def _validate_data(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
