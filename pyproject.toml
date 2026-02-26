@@ -20,6 +20,7 @@ dependencies = [
     "docr>=0.2.1",
     "dcor>=0.7",
     "onnxruntime==1.20.1",
+    "tensorflow>=2.20.0",
 ]
 requires-python = ">=3.10"      # Обновлено для совместимости с современными пакетами
 readme = "README.md"
