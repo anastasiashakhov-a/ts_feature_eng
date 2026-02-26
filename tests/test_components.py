@@ -7,6 +7,8 @@
 - Селекторы признаков
 - Извлечение мета-признаков
 - Базовый пайплайн
+- Отслеживание времени экспериментов (НОВОЕ!)
+- Сохранение результатов в CSV/JSON (НОВОЕ!)
 
 Идеально для:
 - Проверки после изменений в коде
@@ -17,6 +19,7 @@
 import os
 import sys
 import time
+import json
 import traceback
 import numpy as np
 import pandas as pd
@@ -31,6 +34,7 @@ TEST_CONFIG = {
     "n_initial_points": 1,      # Минимум начальных точек
     "random_state": 42,
     "verbose": 1,
+    "results_dir": "test_results",  # Директория для тестовых результатов
 }
 
 
@@ -388,6 +392,247 @@ def test_pipeline_integration(X, y):
 
 
 # ============================================================================
+# НОВЫЕ ТЕСТЫ: ОТСЛЕЖИВАНИЕ ВРЕМЕНИ И СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
+# ============================================================================
+
+def test_experiment_timing():
+    """Тест отслеживания времени эксперимента."""
+    result = TestResult("Experiment Timing")
+    start = time.time()
+    try:
+        from experiment_tracker import ExperimentTracker
+        
+        # Создаём трекер
+        tracker = ExperimentTracker(experiment_id="test_exp_001")
+        
+        # Записываем время начала
+        tracker.start()
+        time.sleep(0.5)  # Имитация работы
+        
+        # Записываем время окончания
+        tracker.stop()
+        
+        # Проверки
+        assert tracker.start_time is not None, "Время начала не записано"
+        assert tracker.end_time is not None, "Время окончания не записано"
+        assert tracker.duration_seconds >= 0.5, f"Длительность слишком короткая: {tracker.duration_seconds}s"
+        assert tracker.duration_formatted, "Форматированная длительность пуста"
+        
+        result.passed = True
+        result.details = f"Длительность: {tracker.duration_formatted} ({tracker.duration_seconds:.2f}s)"
+    except Exception as e:
+        result.error = str(e)
+        traceback.print_exc()
+    finally:
+        result.duration = time.time() - start
+    
+    return result
+
+
+def test_csv_results_save():
+    """Тест сохранения результатов в CSV."""
+    result = TestResult("CSV Results Save")
+    start = time.time()
+    try:
+        import os
+        from results_manager import ResultsManager
+        
+        # Создаём директорию для тестов
+        os.makedirs(TEST_CONFIG["results_dir"], exist_ok=True)
+        
+        # Создаём менеджер результатов
+        manager = ResultsManager(results_dir=TEST_CONFIG["results_dir"])
+        
+        # Тестовые метрики
+        metrics = {
+            "MAE": 0.05,
+            "RMSE": 0.07,
+            "R2": 0.95,
+            "n_features": 50,
+        }
+        
+        # Сохраняем результаты
+        manager.save_metrics(
+            experiment_id="test_csv_001",
+            horizon=1,
+            metrics=metrics,
+            duration_seconds=10.5
+        )
+        
+        # Проверяем файл
+        metrics_file = os.path.join(TEST_CONFIG["results_dir"], "metrics_history.csv")
+        assert os.path.exists(metrics_file), "CSV файл не создан"
+        
+        # Читаем и проверяем содержимое
+        df = pd.read_csv(metrics_file)
+        assert "duration_seconds" in df.columns, "Отсутствует колонка duration_seconds"
+        assert "duration_formatted" in df.columns, "Отсутствует колонка duration_formatted"
+        assert len(df) > 0, "CSV файл пуст"
+        
+        # Проверяем значение длительности
+        last_row = df.iloc[-1]
+        assert last_row["duration_seconds"] == 10.5, f"Неверная длительность: {last_row['duration_seconds']}"
+        assert "0ч 0м 10с" in last_row["duration_formatted"], f"Неверный формат: {last_row['duration_formatted']}"
+        
+        result.passed = True
+        result.details = f"CSV сохранён: {len(df)} записей, duration_seconds={last_row['duration_seconds']}"
+    except Exception as e:
+        result.error = str(e)
+        traceback.print_exc()
+    finally:
+        result.duration = time.time() - start
+    
+    return result
+
+
+def test_json_summary_save():
+    """Тест сохранения JSON отчёта."""
+    result = TestResult("JSON Summary Save")
+    start = time.time()
+    try:
+        import os
+        from results_manager import ResultsManager
+        from datetime import datetime
+        
+        # Создаём директорию для тестов
+        os.makedirs(TEST_CONFIG["results_dir"], exist_ok=True)
+        
+        # Создаём менеджер результатов
+        manager = ResultsManager(results_dir=TEST_CONFIG["results_dir"])
+        
+        # Тестовые данные
+        start_time = datetime.now()
+        time.sleep(0.5)
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        results_data = [
+            {"horizon": 1, "mae": 0.05, "r2": 0.95},
+            {"horizon": 7, "mae": 0.08, "r2": 0.90},
+        ]
+        
+        # Сохраняем JSON отчёт
+        manager.save_summary(
+            experiment_id="test_json_001",
+            start_time=start_time,
+            end_time=end_time,
+            duration_seconds=duration,
+            horizons_tested=[1, 7],
+            config={"n_calls": 2, "random_state": 42},
+            results=results_data
+        )
+        
+        # Проверяем файл
+        summary_file = os.path.join(TEST_CONFIG["results_dir"], "experiment_test_json_001_summary.json")
+        assert os.path.exists(summary_file), "JSON файл не создан"
+        
+        # Читаем и проверяем содержимое
+        with open(summary_file, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        
+        assert "experiment_id" in summary, "Отсутствует experiment_id"
+        assert "start_time" in summary, "Отсутствует start_time"
+        assert "end_time" in summary, "Отсутствует end_time"
+        assert "duration_seconds" in summary, "Отсутствует duration_seconds"
+        assert "duration_formatted" in summary, "Отсутствует duration_formatted"
+        assert "results" in summary, "Отсутствует results"
+        assert summary["experiment_id"] == "test_json_001", "Неверный experiment_id"
+        assert summary["duration_seconds"] >= 0.5, f"Длительность слишком короткая: {summary['duration_seconds']}"
+        
+        result.passed = True
+        result.details = f"JSON сохранён: duration={summary['duration_formatted']}"
+    except Exception as e:
+        result.error = str(e)
+        traceback.print_exc()
+    finally:
+        result.duration = time.time() - start
+    
+    return result
+
+
+def test_duration_formatting():
+    """Тест форматирования длительности."""
+    result = TestResult("Duration Formatting")
+    start = time.time()
+    try:
+        from experiment_tracker import format_duration
+        
+        # Тестовые случаи
+        test_cases = [
+            (0.5, "0ч 0м 0с"),
+            (10.5, "0ч 0м 10с"),
+            (65.0, "0ч 1м 5с"),
+            (3661.0, "1ч 1м 1с"),
+            (7325.0, "2ч 2м 5с"),
+        ]
+        
+        for seconds, expected in test_cases:
+            formatted = format_duration(seconds)
+            assert formatted == expected, f"Для {seconds}s ожидалось '{expected}', получено '{formatted}'"
+        
+        result.passed = True
+        result.details = f"Все {len(test_cases)} тестовых случаев пройдены"
+    except Exception as e:
+        result.error = str(e)
+        traceback.print_exc()
+    finally:
+        result.duration = time.time() - start
+    
+    return result
+
+
+def test_csv_update_duration():
+    """Тест обновления длительности в существующем CSV."""
+    result = TestResult("CSV Update Duration")
+    start = time.time()
+    try:
+        import os
+        from results_manager import ResultsManager
+        
+        # Создаём директорию для тестов
+        os.makedirs(TEST_CONFIG["results_dir"], exist_ok=True)
+        
+        # Создаём менеджер результатов
+        manager = ResultsManager(results_dir=TEST_CONFIG["results_dir"])
+        
+        # Сначала сохраняем без длительности
+        manager.save_metrics(
+            experiment_id="test_update_001",
+            horizon=1,
+            metrics={"MAE": 0.05},
+            duration_seconds=None  # Пока None
+        )
+        
+        # Затем обновляем с длительностью
+        manager.update_experiment_duration(
+            experiment_id="test_update_001",
+            duration_seconds=15.7
+        )
+        
+        # Проверяем файл
+        metrics_file = os.path.join(TEST_CONFIG["results_dir"], "metrics_history.csv")
+        df = pd.read_csv(metrics_file)
+        
+        # Находим строку с нашим experiment_id
+        mask = df["experiment_id"] == "test_update_001"
+        assert mask.any(), "Запись не найдена в CSV"
+        
+        row = df[mask].iloc[-1]
+        assert row["duration_seconds"] == 15.7, f"Длительность не обновилась: {row['duration_seconds']}"
+        assert "0ч 0м 15с" in row["duration_formatted"], f"Формат неверный: {row['duration_formatted']}"
+        
+        result.passed = True
+        result.details = f"Длительность обновлена: {row['duration_formatted']}"
+    except Exception as e:
+        result.error = str(e)
+        traceback.print_exc()
+    finally:
+        result.duration = time.time() - start
+    
+    return result
+
+
+# ============================================================================
 # ЗАПУСК ТЕСТОВ
 # ============================================================================
 
@@ -401,7 +646,7 @@ def run_all_tests():
     print("=" * 80)
     
     # Создание тестовых данных
-    print("\n[0/9] Создание тестовых данных...")
+    print("\n[0/14] Создание тестовых данных...")
     start = time.time()
     X, y = create_test_data(n_samples=TEST_CONFIG["n_samples"])
     print(f"   ✓ Данные созданы: {X.shape[0]} наблюдений, {X.shape[1]} признаков")
@@ -409,16 +654,26 @@ def run_all_tests():
     
     # Список тестов
     tests = [
+        # Базовые трансформеры
         ("LagTransformer", test_lag_transformer),
         ("WindowTransformer", test_window_transformer),
         ("DWTTransformer", test_dwt_transformer),
         ("STLTransformer", test_stl_transformer),
         ("TimeEncodingTransformer", test_time_encoding_transformer),
         ("CalendarFeaturesTransformer", test_calendar_transformer),
+        
+        # Мета-признаки и пайплайн
         ("MetaFeatureExtractor", test_meta_features),
         ("AutoFeatureEngineer", test_auto_feature_engineer),
         ("CombinedFeatureSelector", test_feature_selector),
         ("Pipeline Integration", test_pipeline_integration),
+        
+        # Тесты времени и сохранения
+        ("Experiment Timing", test_experiment_timing),
+        ("Duration Formatting", test_duration_formatting),
+        ("CSV Results Save", test_csv_results_save),
+        ("JSON Summary Save", test_json_summary_save),
+        ("CSV Update Duration", test_csv_update_duration),
     ]
     
     # Запуск тестов
@@ -429,7 +684,7 @@ def run_all_tests():
     
     for i, (name, test_func) in enumerate(tests, 1):
         print(f"\n[{i}/{len(tests)}] Тест: {name}...")
-        result = test_func(X, y)
+        result = test_func(X, y) if test_func.__name__.startswith("test_") and "timing" not in test_func.__name__ and "csv" not in test_func.__name__ and "json" not in test_func.__name__ and "duration" not in test_func.__name__ else test_func()
         results.append(result)
         print(f"   {result}")
         if not result.passed:
@@ -444,12 +699,25 @@ def run_all_tests():
     failed = len(results) - passed
     total_duration = sum(r.duration for r in results)
     
-    print(f"\nВсего тестов: {len(results)}")
-    print(f"✓ Пройдено: {passed}")
-    print(f"✗ Провалено: {failed}")
-    print(f"Общее время: {total_duration:.2f}s ({total_duration/60:.2f} мин)")
+    # Группировка по категориям
+    core_tests = [r for r in results if r.name in ["LagTransformer", "WindowTransformer", "DWTTransformer", "STLTransformer", "TimeEncodingTransformer", "CalendarFeaturesTransformer", "MetaFeatureExtractor", "AutoFeatureEngineer", "CombinedFeatureSelector", "Pipeline Integration"]]
+    timing_tests = [r for r in results if r.name in ["Experiment Timing", "Duration Formatting", "CSV Results Save", "JSON Summary Save", "CSV Update Duration"]]
     
-    print("\nДетали:")
+    print(f"\n ВСЕГО:")
+    print(f"   Всего тестов: {len(results)}")
+    print(f"   ✓ Пройдено: {passed}")
+    print(f"   ✗ Провалено: {failed}")
+    print(f"   Общее время: {total_duration:.2f}s ({total_duration/60:.2f} мин)")
+    
+    print(f"\n БАЗОВЫЕ КОМПОНЕНТЫ ({len(core_tests)}):")
+    core_passed = sum(1 for r in core_tests if r.passed)
+    print(f"   ✓ Пройдено: {core_passed}/{len(core_tests)}")
+    
+    print(f"\n ОТСЛЕЖИВАНИЕ ВРЕМЕНИ ({len(timing_tests)}):")
+    timing_passed = sum(1 for r in timing_tests if r.passed)
+    print(f"   ✓ Пройдено: {timing_passed}/{len(timing_tests)}")
+    
+    print("\n Детали:")
     for result in results:
         status = "✓" if result.passed else "✗"
         print(f"  {status} {result.name}: {result.details if result.passed else result.error}")
@@ -470,13 +738,13 @@ def run_all_tests():
             status = "PASS" if result.passed else "FAIL"
             f.write(f"  [{status}] {result.name}: {result.details if result.passed else result.error}\n")
     
-    print(f"\nОтчёт сохранён в: {report_file}")
+    print(f"\n Отчёт сохранён в: {report_file}")
     
     print("\n" + "=" * 80)
     if failed == 0:
-        print("✓ ВСЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!")
+        print(" ВСЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!")
     else:
-        print(f"✗ {failed} ТЕСТ(ОВ) ПРОВАЛЕНО!")
+        print(f" {failed} ТЕСТ(ОВ) ПРОВАЛЕНО!")
         print("Проверьте ошибки выше перед запуском долгих экспериментов.")
     print("=" * 80)
     
