@@ -250,8 +250,19 @@ class MetaFeatureExtractor:
     def _extract_statistical_features(self, X: pd.DataFrame) -> Dict[str, float]:
         """Извлечение статистических свойств ряда."""
         # Работаем с первым столбцом для многомерных рядов
-        series = X.iloc[:, 0].dropna().values
         features = {}
+
+        numeric_cols = X.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) == 0:
+            return {k: np.nan for k in [
+                "stationarity_adf", "stationarity_kpss", "linearity", "variance",
+                "skewness", "kurtosis", "normality_shapiro", "normality_jarque",
+                "autocorrelation_ljungbox", "homoskedasticity_bp",
+                "acf_1", "acf_24", "acf_168", "acf_30", "acf_365"
+            ]}
+        
+        # Работаем с первым числовым столбцом
+        series = X[numeric_cols[0]].dropna().values.astype(float) 
         
         if len(series) < 10:
             # Возвращаем NaN значения для коротких рядов
