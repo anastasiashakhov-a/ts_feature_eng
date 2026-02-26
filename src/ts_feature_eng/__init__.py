@@ -40,6 +40,19 @@ from .utils.time_series import (
 )
 from .utils.metrics import mae, rmse, mape, smape, mase, r2
 
+# Анализ и визуализация (если модуль существует)
+try:
+    from .analysis import (
+        analyze_feature_selection,
+        compare_feature_selection_methods,
+        analyze_feature_intersection, 
+        plot_correlation_matrix,
+        evaluate_selection_impact,
+    )
+    _HAS_ANALYSIS = True
+except ImportError:
+    _HAS_ANALYSIS = False
+
 # Экспорт основных компонентов для удобства использования
 __all__ = [
     # Основной интерфейс
@@ -80,10 +93,13 @@ __all__ = [
     "smape",
     "mase",
     "r2",
-
-    "analyze_feature_selection",
-    "compare_feature_selection_methods",
-    "analyze_feature_intersection", 
-    "plot_correlation_matrix",
-    "evaluate_selection_impact",
 ]
+
+if _HAS_ANALYSIS:
+    __all__.extend([
+        "analyze_feature_selection",
+        "compare_feature_selection_methods",
+        "analyze_feature_intersection", 
+        "plot_correlation_matrix",
+        "evaluate_selection_impact",
+    ])
